@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-backup",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Backup every session before it is deleted, batch-select sessions in the Web GUI, and restore a backup in one click",
   "keywords": [
     "deepseek-harness",
