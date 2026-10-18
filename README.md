@@ -1,151 +1,137 @@
 # dsh-session-backup
 
-Backs up every session **before** the DeepSeek Harness Web GUI deletes it, adds multi-select for batch delete/backup to the session list, and restores a backup in one click — all as a user plugin, without touching any installed harness file.
+中文 | [English](./README.en.md)
 
-## What you get
+在 DeepSeek Harness Web 界面**删除会话之前**自动备份它，为会话列表加上多选批量删除/批量备份，并支持一键恢复备份 —— 全部以用户插件的形式实现，不改动任何已安装的 harness 文件。
 
-| feature | where you see it |
+## 你能得到什么
+
+| 功能 | 在哪里看到 |
 | --- | --- |
-| automatic backup on delete | nowhere — confirming **彻底删除… (Delete session…)** silently writes a backup first |
-| multi-select + batch backup/delete | **多选 (Select)** in the sidebar footer, a checkbox on each row, and a **选择/加入选择** row in each session's "…" menu |
-| backup manager with one-click restore | **备份 (Backups)** in the sidebar footer |
+| 删除时自动备份 | 哪里都看不到 —— 确认 **彻底删除…** 时它会先静默写入一份备份 |
+| 多选 + 批量备份/删除 | 侧边栏底部的 **多选**、每一行的复选框，以及每个会话「…」菜单里的 **选择/加入选择** |
+| 备份管理器 + 一键恢复 | 侧边栏底部的 **备份** |
 
-Batch delete reuses the same automatic backup, so a batch never removes a session that was not copied first. If a backup fails, the delete is refused and the error is shown — the only copy of a session never disappears because a backup could not be written.
+批量删除复用同一套自动备份逻辑，所以一批会话里绝不会有哪个没被先复制就删掉。如果备份失败，删除会被拒绝并显示错误 —— 会话的唯一副本绝不会因为备份写不出来而消失。
 
-Blank placeholder rows (the provisional 新建会话 / New session row) and archived rows carry no checkbox: the harness renders neither a status slot nor its own actions for them, so they cannot be selected. They hold no conversation to preserve, and the next 新建会话 adopts the blank one.
+空白占位行（临时的「新建会话」行）和已归档的行没有复选框：harness 不为它们渲染状态槽位也不渲染自己的操作，因此无法被选中。它们没有需要保留的对话，下一次「新建会话」会领养那个空白行。
 
-## Where backups live
+## 备份存放位置
 
 ```
 $DSH_HOME/backups/sessions/<sessionId>/<timestamp>-<title>/
-├── session.v4.jsonl.zstd        # the session's own directory, copied verbatim
+├── session.v4.jsonl.zstd        # 会话自身的目录，原样复制
 ├── …
-└── backup.json                  # manifest: sessionId, title, createdAt, sourcePath, size
+└── backup.json                  # 清单：sessionId、title、createdAt、sourcePath、size
 ```
 
-The directory name is the local timestamp (`20261017-184533`) followed by the session's **current title**, sanitized for the filesystem (`/ \ : * ? " < > |` and control characters become spaces, capped at 48 characters, `untitled` when nothing usable remains). Two backups inside the same second get `-1`, `-2` … suffixes. `session.lock` and `.DS_Store` never enter a backup; the manifest's `backup.json` never leaves one on restore.
+目录名是本地时间戳（`20261017-184533`）加上会话的**当前标题**，并针对文件系统做了净化（`/ \ : * ? " < > |` 和控制字符替换为空格，最长 48 个字符，若无可用内容则为 `untitled`）。同一秒内的两次备份会得到 `-1`、`-2` … 后缀。`session.lock` 和 `.DS_Store` 永远不会进入备份；清单文件 `backup.json` 在恢复时也不会被复制回去。
 
-Attachments are content-addressed and survive session deletion, so the session directory alone is a complete, restorable copy.
+附件是按内容寻址的，在会话删除后依然存在，所以仅凭会话目录就是一份完整、可恢复的副本。
 
-## How the delete hook works
+## 删除钩子的工作原理
 
-`dsh-client-ui-workspace` reads `ctx.remote.session` — a compound Cordis service name — and calls `deleteSession` on it. That read walks the framework's `internal/get` waterfall, which is where this plugin wraps the service: the normal resolution runs first (whatever resolved it, including `dsh-remote-session-inject-fix`'s fallback), and this plugin wraps whatever comes back so `deleteSession` copies the session to the backup store before handing the request to the host.
+`dsh-client-ui-workspace` 会读取 `ctx.remote.session` —— 一个复合的 Cordis 服务名 —— 并在其上调用 `deleteSession`。这次读取会走框架的 `internal/get` 瀑布流，本插件正是在这里包装该服务：先执行正常的解析（无论是什么解析出来的，包括 `dsh-remote-session-inject-fix` 的兜底），然后本插件包装返回的结果，使 `deleteSession` 在把请求交给 host 之前先把会话复制到备份库。
 
-The listener is registered with `prepend` so it stays outermost regardless of plugin order — the tests cover both orders.
+监听器以 `prepend` 方式注册，因此无论插件顺序如何它都保持在最外层。
 
-Semantics of a failed backup:
+备份失败时的语义：
 
-| failure | result |
+| 失败情形 | 结果 |
 | --- | --- |
-| host route answers a real error (disk full, conflict, …) | delete **refused**, failed `RemoteResult` returned, error dialog shown |
-| session has no directory left to back up | delete proceeds (nothing to copy), console note |
-| this profile has no Host face mounted (404/405 without our error code) | delete proceeds, console note — the plugin can never become a delete-blocker |
+| host 路由返回真实错误（磁盘满、冲突……） | 删除**被拒绝**，返回失败的 `RemoteResult`，显示错误对话框 |
+| 会话已无目录可供备份 | 删除照常进行（无东西可复制），控制台提示 |
+| 该 profile 未挂载 Host 面（返回 404/405 且没有我们的错误码） | 删除照常进行，控制台提示 —— 本插件绝不会变成删除拦截器 |
 
-## HTTP routes
+## HTTP 路由
 
-All four are registered on the Host connection below `/api`, address document-relative by the browser (`.slice(1)`), and answer JSON:
+四条路由都注册在 Host 连接的 `/api` 之下，由浏览器按文档相对路径访问（`.slice(1)`），并返回 JSON：
 
-| method | path | body | answers |
+| 方法 | 路径 | 请求体 | 响应 |
 | --- | --- | --- | --- |
-| `GET` | `/api/session.backup.list` | — | `{ backups: [...] }` newest first |
-| `POST` | `/api/session.backup.create` | `{ sessionId }` | `{ backup }` with `path`, `title`, `dirName`, `bytes`, `consistent` |
-| `POST` | `/api/session.backup.restore` | `{ path }` | `{ restored }` with `attached`, `workspaceId` / `reason`; 409 if the session exists again |
-| `POST` | `/api/session.backup.remove` | `{ path }` | `{ removed }`; prunes an empty session group |
+| `GET` | `/api/session.backup.list` | — | `{ backups: [...] }`，最新的在前 |
+| `POST` | `/api/session.backup.create` | `{ sessionId }` | `{ backup }`，含 `path`、`title`、`dirName`、`bytes`、`consistent` |
+| `POST` | `/api/session.backup.restore` | `{ path }` | `{ restored }`，含 `attached`、`workspaceId` / `reason`；若会话已再次存在则返回 409 |
+| `POST` | `/api/session.backup.remove` | `{ path }` | `{ removed }`；会顺带清理空的会话分组 |
 
-`sessionId` must match a plain id pattern and every client-supplied path is checked to be strictly inside its root, so no request can reach outside the store. The title comes from the `sessionQuery` service (`readTitle`), falling back to `untitled` when it cannot be read. Before copying a live session the host flushes its in-memory log through the `sessions` service — the same barrier `dsh-session-log-export` uses — and each file's size is re-verified after the copy, so a log still being appended is re-copied and a copy that never settles is reported in the manifest (`consistent: false`) instead of silently shipping a torn file.
+`sessionId` 必须匹配普通的 id 模式，且每一条客户端提供的路径都会被校验必须严格位于其根目录之内，因此任何请求都无法触及备份库之外。标题来自 `sessionQuery` 服务（`readTitle`），读不到时回退为 `untitled`。在复制一个正在运行的会话之前，host 会通过 `sessions` 服务把内存中的日志落盘 —— 与 `dsh-session-log-export` 使用的是同一道屏障 —— 并在复制后重新校验每个文件的大小，因此仍在追加的日志会被重新复制，而始终无法稳定的副本会在清单中被标记（`consistent: false`），而不是悄悄交付一个损坏的文件。
 
-`readTitle` answers with either a bare string or the title provider's snapshot record (`{ title, source, eventSeq, … }`), depending on which query service the profile has; both are unwrapped, so backups are named after the title the Sidebar shows rather than a generic `untitled`.
+`readTitle` 的返回既可能是裸字符串，也可能是标题提供方的快照记录（`{ title, source, eventSeq, … }`），具体取决于该 profile 拥有哪种查询服务；两种形式都会被解包，所以备份会以侧边栏显示的标题命名，而不是一个笼统的 `untitled`。
 
-## Restore also puts the session back in the Sidebar
+## 恢复还会把会话放回侧边栏
 
-Copying the directory back is only half of a restore. Deleting a session does two things — it removes the directory *and* drops the id from its Workspace record — and the Sidebar lists Workspace membership, not the raw directory tree, so a restore that only copies files leaves an invisible session behind (verified: it stays hidden even after a full `dsh web` restart).
+把目录复制回去只是恢复的一半。删除会话会做两件事 —— 移除目录*以及*从其 Workspace 记录中丢掉该 id —— 而侧边栏列出的是 Workspace 成员关系，不是原始的目录树，因此只复制文件的恢复会留下一个看不见的会话（已验证：即使完整重启 `dsh web` 它依然隐藏）。
 
-So `restore` finishes by re-attaching the id through the harness's own API, `workspace.attachSession(sessionId)`. That call re-reads the restored session's header from persistence and refuses unless its `cwd` resolves to that Workspace's path, so the restore cannot attach a session to the wrong project. The response reports the outcome:
+所以 `restore` 最后会通过 harness 自己的 API 重新附加该 id：`workspace.attachSession(sessionId)`。该调用会从持久化层重新读取恢复后会话的头部，并且除非其 `cwd` 解析到该 Workspace 的路径，否则拒绝附加，因此恢复不会把会话挂到错误的项目上。响应会报告结果：
 
-| `restored.attached` | meaning |
+| `restored.attached` | 含义 |
 | --- | --- |
-| `true` | re-attached; `workspaceId` names the Workspace, and the session is listed again (reload the page if the list was already open) |
-| `false` | files are restored but the session stays unlisted; `reason` says why — no Workspace matches the log's `cwd`, the header is unreadable, or this profile has no `workspaceRegistry` |
+| `true` | 已重新附加；`workspaceId` 指明是哪个 Workspace，会话会重新出现在列表中（若列表已展开则刷新页面） |
+| `false` | 文件已恢复但会话仍不出现在列表；`reason` 说明原因 —— 没有 Workspace 匹配日志的 `cwd`、头部不可读，或该 profile 没有 `workspaceRegistry` |
 
-A failed attachment never fails the request: the bytes are already back, and the copy would only be refused as a conflict on a retry.
+附加失败绝不会让整个请求失败：数据字节已经恢复，而重试时那次复制也只会被当作冲突拒绝。
 
-## Two faces: `index.js` and `client.js`
+## 两个面：`index.js` 与 `client.js`
 
-The Harness loads this package twice, from two different module systems:
+Harness 会用两套不同的模块系统加载本包两次：
 
-| face | file | consumed by |
+| 面 | 文件 | 消费方 |
 | --- | --- | --- |
-| host (Node) | `index.js` | `dsh` importing `exports["."]` |
-| browser | `client.js` | the web host, via `exports["./client"]` |
+| host（Node） | `index.js` | `dsh`，通过 `exports["."]` 导入 |
+| 浏览器 | `client.js` | web host，通过 `exports["./client"]` |
 
-The web host concatenates every `dsh.client.platform: "web"` package's client file into a **classic script** batch served from `/plugins/...`, so `client.js` must register itself with `window.__ModuleLoader__.load({ id, factory })`. Handing it raw ESM makes the whole batch fail with `SyntaxError: Unexpected token 'export'` and the boot screen reports `import failed (see console for the import error)`.
+Web host 会把每个 `dsh.client.platform: "web"` 包的客户端文件拼接成一批**经典脚本**，从 `/plugins/...` 提供服务，因此 `client.js` 必须用 `window.__ModuleLoader__.load({ id, factory })` 注册自身。若直接交给它原生 ESM，整批脚本都会以 `SyntaxError: Unexpected token 'export'` 失败，启动画面会报告 `import failed (see console for the import error)`。
 
-`client.js` is generated from `src/client.mjs` — never edit it directly:
+`client.js` 由 `src/client.mjs` 生成 —— 永远不要直接编辑它：
 
 ```sh
-node scripts/build-client.mjs   # regenerate client.js after editing src/client.mjs
-node --test "tests/**/*.test.mjs"
+node scripts/build-client.mjs   # 编辑 src/client.mjs 后重新生成 client.js
 ```
 
-The build rewrites each ESM import into a `require()` of the same specifier (`react` and `@deepseek-ai/dsh-client-ui-primitives` are seed words), strips `export` while recording the exported names, and fails loudly on Node built-ins, `export default`, or any form it cannot carry. The test suite fails if `client.js` is stale.
+构建脚本会把每条 ESM import 改写为同一标识符的 `require()`（`react` 和 `@deepseek-ai/dsh-client-ui-primitives` 是种子词），去掉 `export` 同时记录导出的名称，遇到 Node 内建模块、`export default` 或任何它无法承载的形式都会立即报错。
 
-## Install
+## 安装
 
-From npm:
+从 npm：
 
 ```sh
-dsh plugin --profile <your-profile> add dsh-session-backup
+dsh plugin --profile <你的 profile> add dsh-session-backup
 ```
 
-From GitHub (pin a tag or commit for a reproducible install):
+从 GitHub（固定 tag 或 commit 可获得可复现的安装）：
 
 ```sh
-dsh plugin --profile <your-profile> add github:overspread/dsh-session-backup
+dsh plugin --profile <你的 profile> add github:overspread/dsh-session-backup
 ```
 
-From a local checkout:
+从本地检出：
 
 ```sh
-dsh plugin --profile <your-profile> add /path/to/session-backup
-dsh --profile <your-profile> --dump-config   # expect a "# == dsh-session-backup" layer
+dsh plugin --profile <你的 profile> add /path/to/session-backup
+dsh --profile <你的 profile> --dump-config   # 应能看到 "# == dsh-session-backup" 这一层
 ```
 
-Then restart the `dsh web` server — the host caches each package's resolved client-bundle path in memory, so an added, removed, or re-pointed `exports["./client"]` only takes effect on a fresh boot.
+然后重启 `dsh web` 服务 —— host 会在内存中缓存每个包解析出的客户端包路径，因此新增、移除或重新指向 `exports["./client"]` 只有在全新启动时才会生效。
 
-## Tests
+## 可经受 harness 升级
 
-```sh
-npm test
-```
+插件位于你的 profile（`~/.dsh/profiles/<name>`）中，而不是已安装的 harness 内部，所以升级 `dsh` 不会移除它。卸载用 `dsh plugin --profile <name> remove dsh-session-backup`。
 
-| file | covers |
-| --- | --- |
-| `tests/backup-store.test.mjs` | naming/sanitizing, inbound guards, locate/create/list/restore/remove against temp dirs, both `readTitle` answer shapes, and the restore → re-attach matrix (match, symlinked path, missing registry, unreadable header, unknown cwd, failing attach) |
-| `tests/routes.test.mjs` | the four HTTP handlers, status codes, and unregistration on dispose |
-| `tests/client-bundle.test.mjs` | build freshness, the classic-script wrap, and the forms the build rejects |
-| `tests/delete-interceptor.test.mjs` | the interceptor against a real Cordis context: backup ordering, refusal on failure, non-blocking when the Host face is absent, pass-through of other properties, and both registration orders alongside `dsh-remote-session-inject-fix` |
+## 发布
 
-Every path above was also driven against a live `dsh web` instance with headless Chrome: boot with the plugin loaded, select → batch backup (directory named `<timestamp>-<title>` with the real title), the harness's own delete dialog writing its automatic backup, one-click restore re-listing the session, batch delete backing up before removing, and deleting backups from the manager.
-
-## Survives harness upgrades
-
-The plugin lives in your profile (`~/.dsh/profiles/<name>`), not inside the installed harness, so upgrading `dsh` does not remove it. Uninstall with `dsh plugin --profile <name> remove dsh-session-backup`.
-
-## Distribution
-
-Releasing a new version:
+发布新版本：
 
 ```sh
-node scripts/build-client.mjs && npm test
+node scripts/build-client.mjs
 npm version patch
-npm publish                # needs an npm login; the tarball ships client.js as built
+npm publish                # 需要 npm 登录；tarball 会带上构建出的 client.js
 git push --follow-tags
 ```
 
-The package has no runtime dependencies; run the build before packing so the tarball ships a `client.js` matching the current `src/client.mjs` (the tests check this). The `files` list in `package.json` keeps `node_modules`, the tests, and `src/` out of the tarball.
+本包没有运行时依赖；打包前请先运行构建，以便 tarball 中的 `client.js` 与当前的 `src/client.mjs` 一致。`package.json` 中的 `files` 列表会把 `node_modules` 和 `src/` 排除在 tarball 之外。
 
-## License
+## 许可证
 
-[MIT](./LICENSE) © overspread.
+[MIT](./LICENSE) © overspread。
 
-This is a personal, community plugin. It is not developed, endorsed, or supported by DeepSeek, and it is not part of the DeepSeek Harness distribution. It only reads and writes inside your own `$DSH_HOME`; review the source before installing, as with any third-party plugin that runs on your machine.
+这是一个个人的社区插件。它不由 DeepSeek 开发、背书或支持，也不是 DeepSeek Harness 发行版的一部分。它只在你自己的 `$DSH_HOME` 内读写；像任何会在你机器上运行的第三方插件一样，安装前请审阅源码。
