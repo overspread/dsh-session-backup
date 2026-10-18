@@ -1,0 +1,58 @@
+{
+  "name": "dsh-session-backup",
+  "version": "0.1.0",
+  "description": "Backup every session before it is deleted, batch-select sessions in the Web GUI, and restore a backup in one click",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "plugin",
+    "session",
+    "backup"
+  ],
+  "author": "overspread",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/overspread/dsh-session-backup.git"
+  },
+  "bugs": {
+    "url": "https://github.com/overspread/dsh-session-backup/issues"
+  },
+  "homepage": "https://github.com/overspread/dsh-session-backup#readme",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "scripts/build-client.mjs"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
+  "scripts": {
+    "build": "node scripts/build-client.mjs",
+    "test": "node --test \"tests/**/*.test.mjs\""
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.5-alpha.2"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "~4.0.5-alpha.2"
+  }
+}

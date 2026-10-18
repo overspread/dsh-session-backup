@@ -1,0 +1,6 @@
+# The layer this bundle contributes: the session-backup plugin (host routes +
+# browser selection/restore UI). A bundle patch is an insert-only layer; the
+# row needs no config.
+- insert:
+    - id: session-backup
+      name: dsh-session-backup
