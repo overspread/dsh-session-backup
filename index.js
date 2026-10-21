@@ -1,17 +1,28 @@
 /**
- * Session backup — Host face.
+ * Session backup + permanent deletion — Host face.
  *
- * Owns the on-disk backup store (`$DSH_HOME/backups/sessions/<sessionId>/<stamp>-<title>/`)
- * and the four HTTP routes the Web GUI calls. Every operation is a plain
- * filesystem routine taking explicit roots, so the tests drive them against a
- * temp directory without booting a profile.
+ * Owns two things: the on-disk backup store (`$DSH_HOME/backups/sessions/<sessionId>/<stamp>-<title>/`)
+ * and the five HTTP routes the Web GUI calls (four backup routes plus `delete`).
+ * Every operation is a plain filesystem routine taking explicit roots, so the
+ * tests drive them against a temp directory without booting a profile.
  *
  * A backup is a recursive copy of the session's own directory plus a
  * `backup.json` manifest describing what was taken. Attachments are
  * content-addressed and are NOT purged when a session is deleted, so the
  * session directory alone is a complete, restorable copy.
+ *
+ * The delete engine (below, `deleteSessionCascade`) reproduces the harness's
+ * permanent-deletion cascade as a self-contained plugin, so a profile whose
+ * kernel has no `session/deleteSession` (upstream ≥ 0.2.1-alpha.5, rc line)
+ * gains the same guarantees: activity gate with a stop-activity upgrade,
+ * scheduled-reminder row purge before anything is destroyed, write-lease
+ * probe, durable log removal, and a best-effort derived-cache cascade that
+ * can never resurrect a deleted Session. Cascade steps are probed through
+ * `ctx.get()` and feature-detected at call time, so the same file runs on
+ * both the local alpha.3 build (richer service APIs) and upstream rc.2.
  */
 import { copyFile, cp, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
@@ -116,11 +127,14 @@ export function isoFromStamp(stamp) {
 // Errors
 // ---------------------------------------------------------------------------
 
-/** Build an Error carrying a machine-readable `code` and an HTTP `status`. */
-export function failure(code, message, status = 500) {
+/** Build an Error carrying a machine-readable `code` and an HTTP `status`.
+ * `details` rides the JSON error body so the browser can upgrade its confirm
+ * dialog (the activity list of a `workspace/session-active` refusal). */
+export function failure(code, message, status = 500, details = undefined) {
   const error = new Error(message)
   error.code = code
   error.status = status
+  if (details !== undefined) error.details = details
   return error
 }
 
@@ -396,22 +410,32 @@ export async function listBackups(root) {
  *
  * @param registry - the `workspaceRegistry` service (`{ list, readSessionHeader }`).
  * @param sessionId - the restored session's id.
- * @returns `{ attached: true, workspaceId }`, or `{ attached: false, reason }`
- *   when the session cannot be re-attached — the files are still restored, and
- *   the caller reports that instead of failing a request that already succeeded.
+ * @returns `{ attached: true, workspaceId, placement: 'workspace' }`, or
+ *   `{ attached: false, reason, placement }` where `placement` says where the
+ *   restored session actually landed: `'ungrouped'` — the Sidebar's native
+ *   bucket for sessions that belong to no Workspace (a deleted Workspace, no
+ *   matching `cwd`, or a profile without a registry) — or `'unknown'` for the
+ *   rare unreadable-header / refused-attach cases, which the caller reports as
+ *   a caveat instead of failing a request that already succeeded.
  */
 export async function reattachRestoredSession(registry, sessionId) {
   if (registry === undefined || typeof registry.list !== 'function') {
-    return { attached: false, reason: 'this profile has no workspace registry' }
+    return { attached: false, reason: 'this profile has no workspace registry', placement: 'ungrouped' }
   }
   let header
   try {
     header = await registry.readSessionHeader(sessionId)
   } catch (error) {
-    return { attached: false, reason: `the restored log has no readable header: ${String(error?.message ?? error)}` }
+    return {
+      attached: false,
+      reason: `the restored log has no readable header: ${String(error?.message ?? error)}`,
+      placement: 'unknown',
+    }
   }
   const cwd = typeof header?.cwd === 'string' ? header.cwd : undefined
-  if (cwd === undefined) return { attached: false, reason: 'the restored session header carries no cwd' }
+  if (cwd === undefined) {
+    return { attached: false, reason: 'the restored session header carries no cwd', placement: 'ungrouped' }
+  }
   const resolvedCwd = await realpath(cwd).catch(() => cwd)
   for (const workspace of registry.list()) {
     const path = Reflect.get(workspace, 'path')
@@ -421,11 +445,11 @@ export async function reattachRestoredSession(registry, sessionId) {
     try {
       await workspace.attachSession(sessionId)
     } catch (error) {
-      return { attached: false, reason: String(error?.message ?? error) }
+      return { attached: false, reason: String(error?.message ?? error), placement: 'unknown' }
     }
-    return { attached: true, workspaceId: Reflect.get(workspace, 'id') ?? path }
+    return { attached: true, workspaceId: Reflect.get(workspace, 'id') ?? path, placement: 'workspace' }
   }
-  return { attached: false, reason: `no workspace has cwd ${cwd}` }
+  return { attached: false, reason: `no workspace has cwd ${cwd}`, placement: 'ungrouped' }
 }
 
 export async function restoreBackup(path, options = {}) {
@@ -448,11 +472,23 @@ export async function restoreBackup(path, options = {}) {
     filter: (entry) => basename(entry) !== MANIFEST_FILE && !SKIP_NAMES.has(basename(entry)),
   })
   const attachment = await reattachRestoredSession(options.registry, sessionId)
+  // Restoring consumes the backup: the bytes are back at their live location, so
+  // the copy is spent — restoring again would only be refused as a conflict
+  // anyway. Removal is best-effort (a failed prune never fails a restore that
+  // already succeeded) and reported through `backupConsumed`.
+  let backupConsumed = false
+  try {
+    await removeBackup(source, { home, backupRoot: backups })
+    backupConsumed = true
+  } catch (error) {
+    options.logger?.warn?.(`session-backup: restored but could not remove the backup: ${String(error)}`)
+  }
   return {
     sessionId,
     title: typeof manifest.title === 'string' ? manifest.title : FALLBACK_TITLE,
     target: destination,
     restoredAt: new Date().toISOString(),
+    backupConsumed,
     ...attachment,
   }
 }
@@ -470,6 +506,429 @@ export async function removeBackup(path, options = {}) {
     if (remaining.length === 0) await rm(group, { recursive: true, force: true }).catch(() => {})
   }
   return { path: target, removedAt: new Date().toISOString() }
+}
+
+// ---------------------------------------------------------------------------
+// Delete engine — the permanent-deletion cascade, self-contained
+// ---------------------------------------------------------------------------
+
+/** Lease-probe attempts and backoff: bounded so a batch stays responsive. */
+const BUSY_RETRY_ATTEMPTS = 12
+const BUSY_RETRY_DELAY_MS = 200
+/** Transient lease/handle errors get a few quick retries before refusal. */
+const REMOVE_RETRY_ATTEMPTS = 2
+const REMOVE_RETRY_DELAY_MS = 50
+/** One settle poll between activity checks while a stop lands. */
+const STOP_SETTLE_POLL_MS = 300
+/** Ceiling for waiting out a stop: turn cancellation, job abort and handle
+ * closure each add their own async tail; past this the lease probe decides. */
+const STOP_SETTLE_MAX_MS = 15000
+/** Ids this process destroyed, so a repeat NotFound answers idempotently. */
+const removed = new Set()
+/** One delete per id at a time: a double-confirmed dialog shares the first outcome. */
+const deleting = new Map()
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+const notFoundError = (sessionId) =>
+  failure('session/not-found', `session "${sessionId}" not found`, 404, { sessionId })
+const busyError = (sessionId, activity) =>
+  failure('workspace/session-active', `cannot delete session '${sessionId}': the session is active`, 409, { sessionId, activity })
+const internalError = (sessionId, what, cause) =>
+  failure('gateway/internal', `cannot delete session '${sessionId}': ${what}`, 500, { sessionId, cause: String(cause?.message ?? cause) })
+
+/** Persistence error names used by both the alpha.3 and rc.2 jsonl backends. */
+const isNotFoundErr = (e) => e?.name === 'SessionPersistenceNotFoundError'
+const isBusyErr = (e) =>
+  e?.name === 'SessionPersistenceActiveError' || e?.name === 'SessionAlreadyOwnedError'
+
+/**
+ * The activity gate, asked exactly like the kernel's archive gate: the
+ * `workspace/session-activity` waterfall with an empty default, so every
+ * shipped provider (turn / job / subagent / schedule) answers.
+ * @returns the active items; `[]` when the session is idle or no provider exists.
+ */
+async function askActivity(ctx, sessionId) {
+  if (typeof ctx.waterfall !== 'function') return []
+  try {
+    const activity = await ctx.waterfall('workspace/session-activity', { sessionId }, () => Promise.resolve([]))
+    return Array.isArray(activity) ? activity : []
+  } catch {
+    // A provider that throws must not become a silent delete: treat as active.
+    return [{ kind: 'unknown' }]
+  }
+}
+
+/**
+ * Stop one session's running work and purge its scheduled-reminder rows.
+ * Two independent layers, because a surviving armed row would cold-resume the
+ * log this cascade is about to destroy:
+ *   1. `workspace/session-stop` — both kernel lines register the schedule
+ *      purge plus agent/jobs/subagent turn cancellation on this event.
+ *   2. A direct schedule purge, tried when the event is unavailable and as a
+ *      belt after it: `deleteSessionTasks` on alpha.3, `list`+`delete` on rc.2.
+ * A direct purge failure aborts the whole deletion (`gateway/internal`, the
+ * kernel's code): deleting the log under armed rows leaves a delivery loop
+ * hammering a resurrected Session.
+ */
+async function stopActivityAndPurgeSchedule(ctx, sessionId) {
+  if (typeof ctx.parallel === 'function') {
+    try {
+      await ctx.parallel('workspace/session-stop', { sessionId })
+    } catch (error) {
+      ctx.logger?.warn?.(`session-backup: session-stop providers failed for '${sessionId}': ${String(error)}`)
+    }
+  }
+  const schedule = ctx.get('schedule')
+  if (schedule === undefined || schedule === null) return
+  try {
+    if (typeof schedule.deleteSessionTasks === 'function') {
+      await schedule.deleteSessionTasks(sessionId)
+      return
+    }
+    if (typeof schedule.list === 'function' && typeof schedule.delete === 'function') {
+      const rows = await schedule.list({ sessionId })
+      for (const row of Array.isArray(rows) ? rows : []) {
+        await schedule.delete({ sessionId, id: row.id })
+      }
+    }
+  } catch (error) {
+    throw internalError(sessionId, 'its scheduled reminders could not be removed', error)
+  }
+}
+
+/** Best-effort: a live Agent's factory-owned disposer, when this kernel has one. */
+async function disposeLiveAgent(ctx, sessionId) {
+  const agents = ctx.get('agents')
+  if (typeof agents?.disposeAgent !== 'function') return
+  try {
+    await agents.disposeAgent(sessionId)
+  } catch (error) {
+    ctx.logger?.warn?.(`session-backup: disposing live agent for '${sessionId}' failed: ${String(error)}`)
+  }
+}
+
+/**
+ * Cancel the bare Agent and detach the Session's entered store entry, so the
+ * write-handle close starts before the lease probe races it.
+ *
+ * On rc.2 the agent teardown is a capability: only the creator's AgentHandle
+ * holds `dispose()`, and `ctx.agents.get()` returns a bare Agent — a plugin can
+ * never reach that handle by id. The detach seam is the entry itself: both
+ * kernels keep the store map as a TS-`private` (not `#private`) field whose
+ * entries carry `detach()`, the same seam `dsh-delete-session` rides, and it
+ * fires `session/disposed` — the event whose (fire-and-forget) handler closes
+ * the persistence write handle. Everything is feature-detected: a kernel that
+ * hides the store simply keeps the old behaviour (stop → lease-probe retries).
+ * @returns `true` when an entered entry was detached.
+ */
+async function quiesceAndDetach(ctx, sessionId) {
+  const agents = ctx.get('agents')
+  const agent = typeof agents?.get === 'function' ? agents.get(sessionId) : undefined
+  if (agent !== undefined && agent !== null) {
+    try {
+      if (typeof agent.cancel === 'function') agent.cancel({ kind: 'user' })
+    } catch {
+      // the agent may already be settling
+    }
+    if (typeof agent.whenIdle === 'function') {
+      try {
+        await Promise.race([agent.whenIdle(), sleep(10000)])
+      } catch {
+        // a rejected whenIdle still leaves the detach below authoritative
+      }
+    }
+  }
+  let detached = false
+  const sessions = ctx.get('sessions')
+  if (sessions !== undefined && sessions !== null) {
+    try {
+      const store = Reflect.get(sessions, 'store')
+      if (store !== undefined && store !== null && typeof store.get === 'function') {
+        const entry = store.get(sessionId)
+        if (entry !== undefined && entry !== null && typeof entry.detach === 'function') {
+          entry.detach()
+          detached = true
+        }
+      }
+    } catch (error) {
+      ctx.logger?.warn?.(`session-backup: detaching session '${sessionId}' failed: ${String(error)}`)
+    }
+  }
+  try {
+    const persistence = ctx.get('sessionPersistence')
+    const retirement = persistence?.retirements?.get?.(sessionId)
+    if (retirement !== undefined && retirement !== null && typeof retirement.then === 'function') await retirement
+  } catch {
+    // no retirement registry on this kernel: the lease probe's bounded retry
+    // below already covers the close's tail.
+  }
+  return detached
+}
+
+/**
+ * Flush every write handle, then prove exclusive ownership of the id's write
+ * lease: a successful `open(id,'write')` means no other writer lives, and the
+ * handle is closed at once so the removal below is the only writer. Busy is
+ * retried (a detach's lease retirement lands asynchronously) and, once
+ * exhausted, refused as active with an empty activity list — exactly the
+ * kernel's empty-activity lease refusal.
+ */
+async function assertNoActiveWriter(ctx, sessionId) {
+  const persistence = ctx.get('sessionPersistence')
+  if (persistence === undefined || persistence === null) return
+  if (typeof persistence.flush === 'function') {
+    try {
+      await persistence.flush()
+    } catch {
+      // A flush failure surfaces as a busy lease below instead of being hidden.
+    }
+  }
+  if (typeof persistence.open !== 'function') return
+  let lastBusy
+  let triedDetach = false
+  for (let attempt = 1; attempt <= BUSY_RETRY_ATTEMPTS; attempt += 1) {
+    let handle
+    try {
+      handle = await persistence.open(sessionId, 'write')
+    } catch (error) {
+      if (isNotFoundErr(error)) throw notFoundError(sessionId)
+      if (!isBusyErr(error)) throw error
+      lastBusy = error
+      if (!triedDetach) {
+        // A busy lease with an empty activity list is this process's own store
+        // entry (rc.2 keeps the handle for an opened Session): detach once and
+        // let the retry window observe the retirement, instead of refusing a
+        // delete the user already confirmed. A writer in another process has no
+        // detachable entry — quiesceAndDetach is a no-op and the window still
+        // refuses honestly.
+        triedDetach = true
+        await quiesceAndDetach(ctx, sessionId)
+      }
+      if (attempt < BUSY_RETRY_ATTEMPTS) await sleep(BUSY_RETRY_DELAY_MS)
+      continue
+    } finally {
+      if (handle !== undefined && typeof handle.close === 'function') {
+        try {
+          await handle.close()
+        } catch {
+          // A failed release only delays the rm below; the lease is ours anyway.
+        }
+      }
+    }
+    return
+  }
+  throw busyError(sessionId, [])
+}
+
+/** Remove the durable log. Prefers the kernel's `remove()` (alpha.3); falls
+ * back to a located directory + `rm` with a post-verify (rc.2, which ships
+ * no remove). NotFound answers from this process's removal record so a repeat
+ * delete is the idempotent success the UI expects. */
+async function removeStored(ctx, sessionId, paths) {
+  const persistence = ctx.get('sessionPersistence')
+  if (persistence === undefined || persistence === null) throw notFoundError(sessionId)
+  if (typeof persistence.remove === 'function') {
+    let transient
+    for (let attempt = 0; attempt <= REMOVE_RETRY_ATTEMPTS; attempt += 1) {
+      if (attempt > 0) await sleep(REMOVE_RETRY_DELAY_MS)
+      try {
+        await persistence.remove(sessionId)
+        return
+      } catch (error) {
+        if (isNotFoundErr(error)) {
+          if (removed.has(sessionId)) return
+          throw notFoundError(sessionId)
+        }
+        if (isBusyErr(error)) {
+          transient = error
+          continue
+        }
+        throw error
+      }
+    }
+    throw busyError(sessionId, [])
+  }
+  // No remove(): stat proves existence, the probe above proved exclusivity.
+  const snapshot = typeof persistence.stat === 'function' ? await persistence.stat(sessionId) : undefined
+  if (snapshot === undefined || snapshot === null) {
+    if (removed.has(sessionId)) return
+    throw notFoundError(sessionId)
+  }
+  const dir = await locateSessionDir(sessionId, paths.sessionsRoot)
+  if (dir === undefined) throw internalError(sessionId, 'its log directory could not be located', new Error('no directory'))
+  await rm(dir, { recursive: true, force: true })
+  const after = typeof persistence.stat === 'function' ? await persistence.stat(sessionId) : undefined
+  if (after !== undefined && after !== null) {
+    throw internalError(sessionId, 'its log directory survived removal', new Error(`still visible at ${dir}`))
+  }
+}
+
+/**
+ * Best-effort derived-cache cascade after the log is gone. Every step is
+ * optional and fail-soft — a residual cache row cannot resurrect a destroyed
+ * Session, and the attachment blob store is content-addressed/shared, so it is
+ * never touched (spec A5). Workspace accounting runs last so a failed step
+ * above cannot leave a detached id behind.
+ * @returns the steps that failed, for the caller's log line.
+ */
+async function cascadeCaches(ctx, sessionId, paths) {
+  const failed = []
+  const warn = (step, error) => {
+    failed.push(step)
+    ctx.logger?.warn?.(`session-backup: deleting ${step} for '${sessionId}' failed: ${String(error)}`)
+  }
+  // spill: the alpha.3 store owns removeSession; rc.2's store exposes only its
+  // root, whose per-session directory is `session-<sha256(id) first 12>`.
+  try {
+    const spill = ctx.get('spillStore')
+    if (spill !== undefined && spill !== null) {
+      if (typeof spill.removeSession === 'function') await spill.removeSession(sessionId)
+      else if (typeof spill.root === 'string' && spill.root !== '') {
+        const hash = createHash('sha256').update(sessionId).digest('hex').slice(0, 12)
+        await rm(join(spill.root, `session-${hash}`), { recursive: true, force: true })
+      }
+    }
+  } catch (error) {
+    warn('spill cache', error)
+  }
+  // projection cache: the alpha.3 service invalidates; rc.2 stores one JSON
+  // file per session under <storages>/session_projcache/sessions/.
+  try {
+    const projection = ctx.get('sessionProjectionCache')
+    if (projection !== undefined && projection !== null && typeof projection.invalidate === 'function') {
+      await projection.invalidate(sessionId)
+    } else {
+      await rm(join(paths.storagesRoot, 'session_projcache', 'sessions', `${sessionId}.json`), { force: true })
+    }
+  } catch (error) {
+    warn('projection checkpoint', error)
+  }
+  // workspace accounting: alpha.3 has unaccountSession (clears archived +
+  // pinned + every entity's sessionIds in one chain); rc.2 needs the three
+  // public calls per workspace.
+  try {
+    const registry = ctx.get('workspaceRegistry')
+    if (registry !== undefined && registry !== null) {
+      if (typeof registry.unaccountSession === 'function') {
+        await registry.unaccountSession(sessionId)
+      } else if (typeof registry.list === 'function') {
+        for (const workspace of registry.list()) {
+          try {
+            if (typeof workspace.unarchiveSession === 'function') await workspace.unarchiveSession(sessionId)
+            if (typeof workspace.unpinSession === 'function') await workspace.unpinSession(sessionId)
+            if (typeof workspace.detachSession === 'function') await workspace.detachSession(sessionId)
+          } catch (error) {
+            warn(`workspace accounting (${Reflect.get(workspace, 'id') ?? 'unknown'})`, error)
+          }
+        }
+      }
+    }
+  } catch (error) {
+    warn('workspace accounting', error)
+  }
+  return failed
+}
+
+/**
+ * Permanently delete one Session: scheduled reminders, durable log, spill,
+ * projection checkpoint, workspace accounting. Idle sessions delete outright;
+ * running work is refused (`workspace/session-active` + the activity list, so
+ * the dialog upgrades in place to its stop-first variant) unless the caller
+ * chose `stopActivity`, which stops that work first — the kernel's gate,
+ * replayed on the plugin's own routes.
+ * @param ctx - host context, source of every cascade service.
+ * @param sessionId - the Session to destroy.
+ * @param options - `{ stopActivity }`.
+ * @returns `{ deleted: true }`, including for an id this process already deleted.
+ */
+export async function deleteSessionCascade(ctx, sessionId, options = {}) {
+  assertSessionId(sessionId)
+  const existing = deleting.get(sessionId)
+  if (existing !== undefined) return await existing
+  const operation = runDelete(ctx, sessionId, options.stopActivity === true, options.paths)
+  deleting.set(sessionId, operation)
+  try {
+    return await operation
+  } finally {
+    if (deleting.get(sessionId) === operation) deleting.delete(sessionId)
+  }
+}
+
+async function runDelete(ctx, sessionId, stopActivity, explicitPaths) {
+  const paths = explicitPaths ?? deletePaths()
+  const persistence = ctx.get('sessionPersistence')
+  // Idempotent repeat: this process already destroyed the id.
+  if (removed.has(sessionId)) {
+    const still = persistence !== undefined && persistence !== null && typeof persistence.stat === 'function'
+      ? await persistence.stat(sessionId).catch(() => undefined)
+      : undefined
+    if (still === undefined || still === null) return { deleted: true }
+  }
+  if (persistence !== undefined && persistence !== null && typeof persistence.stat === 'function') {
+    const snapshot = await persistence.stat(sessionId).catch(() => undefined)
+    if (snapshot === undefined || snapshot === null) throw notFoundError(sessionId)
+  }
+
+  if (stopActivity) {
+    await stopActivityAndPurgeSchedule(ctx, sessionId)
+    // Cancel the bare agent and detach the entered entry FIRST: on rc.2 the
+    // teardown capability is unreachable by id, and the write-handle close is
+    // a fire-and-forget tail of `session/disposed` — without this the lease
+    // probe below refuses a stop the user already confirmed.
+    await quiesceAndDetach(ctx, sessionId)
+    // Stop providers are fire-and-warn: a cancelled turn, an aborted job and
+    // the write-handle close each land on their own async tails. Wait until the
+    // activity gate answers empty (the same providers the first confirmation
+    // asked), so the lease probe below does not race a half-settled stop and
+    // refuse as busy. The ceiling is generous; past it the lease probe's own
+    // bounded retry still refuses honestly.
+    const settleDeadline = Date.now() + STOP_SETTLE_MAX_MS
+    for (;;) {
+      const activity = await askActivity(ctx, sessionId)
+      if (activity.length === 0) break
+      if (Date.now() >= settleDeadline) break
+      await sleep(STOP_SETTLE_POLL_MS)
+    }
+  } else {
+    // The gate is the archive gate: same providers, same code, same payload,
+    // so the client's busy-confirm rendering covers deletion unchanged.
+    const activity = await askActivity(ctx, sessionId)
+    if (activity.length > 0) throw busyError(sessionId, activity)
+    // Idle or not, armed schedule rows die first — they would cold-resume the
+    // log this cascade destroys (kernel step order, spec B1 1a).
+    await stopActivityAndPurgeSchedule(ctx, sessionId)
+    // rc.2's kernel store keeps the write handle open for an opened — even
+    // idle — Session until `session/disposed` closes it, so the lease probe
+    // below would exhaust its retries and refuse with an EMPTY activity list:
+    // a refusal the client cannot render as a stop-first upgrade, and the
+    // dead end that broke idle deletes after the rc.2 upgrade (two backups,
+    // no deletion). Detach first — the same seam the stop branch rides.
+    await quiesceAndDetach(ctx, sessionId)
+  }
+
+  await disposeLiveAgent(ctx, sessionId)
+  await assertNoActiveWriter(ctx, sessionId)
+  await removeStored(ctx, sessionId, paths)
+  removed.add(sessionId)
+  const failed = await cascadeCaches(ctx, sessionId, paths)
+  // The GUI's session list listens for this one; the row disappears without a
+  // full refresh (the kernel emits it on the same removal).
+  try {
+    ctx.emit?.('api-session/removed', sessionId)
+  } catch (error) {
+    ctx.logger?.warn?.(`session-backup: removed-event for '${sessionId}' failed: ${String(error)}`)
+  }
+  if (failed.length > 0) {
+    ctx.logger?.warn?.(`session-backup: '${sessionId}' deleted with residual cache steps: ${failed.join(', ')}`)
+  }
+  return { deleted: true }
+}
+
+/** Resolve every root this cascade touches from the current home. */
+function deletePaths() {
+  const home = dshHome()
+  return { home, sessionsRoot: sessionsRoot(home), storagesRoot: join(home, 'storages') }
 }
 
 // ---------------------------------------------------------------------------
@@ -504,7 +963,9 @@ function route(ctx, handler) {
     } catch (error) {
       const status = typeof error?.status === 'number' ? error.status : 500
       if (status >= 500) ctx.logger.error(`session-backup: route ${request.url} failed: ${String(error)}`)
-      return json({ error: { code: error?.code ?? 'session-backup/internal', message: error?.message ?? 'unexpected failure' } }, status)
+      const payload = { code: error?.code ?? 'session-backup/internal', message: error?.message ?? 'unexpected failure' }
+      if (error?.details !== undefined) payload.details = error.details
+      return json({ error: payload }, status)
     }
   }
 }
@@ -516,7 +977,12 @@ function route(ctx, handler) {
  */
 export function apply(ctx, config = {}) {
   const home = config.home ?? dshHome()
-  const paths = { home, sessionsRoot: sessionsRoot(home), backupRoot: backupRoot(home) }
+  const paths = {
+    home,
+    sessionsRoot: sessionsRoot(home),
+    backupRoot: backupRoot(home),
+    storagesRoot: join(home, 'storages'),
+  }
   const fetch = connectionOf(ctx).fetch
   ctx.effect(() => {
     const registered = [
@@ -542,6 +1008,7 @@ export function apply(ctx, config = {}) {
           restored: await restoreBackup(assertRequestPath(body?.path), {
             ...paths,
             registry: ctx?.get?.('workspaceRegistry'),
+            logger: ctx.logger,
           }),
         })),
       }),
@@ -551,6 +1018,17 @@ export function apply(ctx, config = {}) {
         requestBody: 'buffered',
         fetch: route(ctx, async (request, body) => ({
           removed: await removeBackup(assertRequestPath(body?.path), paths),
+        })),
+      }),
+      fetch.register({
+        path: `${API_PATH}.delete`,
+        methods: ['POST'],
+        requestBody: 'buffered',
+        fetch: route(ctx, async (request, body) => ({
+          deleted: await deleteSessionCascade(ctx, assertSessionId(body?.sessionId), {
+            stopActivity: body?.stopActivity === true,
+            paths,
+          }),
         })),
       }),
     ]
