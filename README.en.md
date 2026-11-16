@@ -4,9 +4,7 @@ English | [中文](./README.md)
 
 Backs up every session **before** the DeepSeek Harness Web GUI permanently deletes it, adds multi-select batch delete/backup to the session list, and restores a backup in one click — all as a user plugin, without touching any installed harness file.
 
-From 0.2.0 **permanent deletion itself is also provided by this plugin** (the row-menu delete entry, the confirm dialog, and the cascade engine all live inside the plugin), so upgrading the harness can never take deletion away: upstream ≥ 0.2.1-alpha.5 has no kernel delete at all, and on the local alpha.3 build the kernel's delete row is shadowed — every version renders exactly this plugin's row.
-
-Current version **0.4.2**.
+**Permanent deletion itself is also provided by this plugin** (the row-menu delete entry, the confirm dialog, and the cascade engine all live inside the plugin), so upgrading the harness can never take deletion away: upstream ≥ 0.2.1-alpha.5 has no kernel delete at all, and on the local alpha.3 build the kernel's delete row is shadowed — every version renders exactly this plugin's row.
 
 ## What you get
 
@@ -21,7 +19,7 @@ Blank placeholder rows (the provisional 新建会话 / New session row) and arch
 ## What the backup guarantees
 
 - **Back up before deleting** — single and batch deletion both save the **final backup** through the Host after stopping work and checking the writer, then remove the log, so a batch never removes a session that was not saved first. A failed backup preserves the old copy and the live log and refuses the delete with the reason; only “nothing to copy” and “no Host face mounted” proceed.
-- **One copy per content** — a per-file `relative path:sha256` fingerprint decides: an exact match **reuses** the existing backup (`reused: true`) with no new directory; changed content **refreshes the latest backup at the same path** (`updated: true`), so “back up manually, then delete” always leaves exactly one entry. The new copy is fully written and verified before replacing the old one; failures keep the old backup and abort the delete. Extra preflight requests from cached clients refresh the same way, and existing historical backups are never pruned in bulk.
+- **One copy per content** — a per-file `relative path:sha256` fingerprint decides: an exact match **reuses** the existing backup (`reused: true`) with no new directory; changed content **refreshes the latest backup at the same path** (`updated: true`), so “back up manually, then delete” always leaves exactly one entry. The new copy is fully written and verified before replacing the old one; failures keep the old backup and abort the delete. A repeated backup request refreshes the same way, and existing historical backups are never pruned in bulk.
 - **Concurrency-safe** — backup / restore / remove-backup requests for one session run serialized, so clicking a manual backup and a delete together never writes two copies.
 
 ## Quick start
@@ -44,9 +42,9 @@ The directory name is the local timestamp (`20261017-184533`) followed by the se
 
 Attachments are content-addressed and survive session deletion, so the session directory alone is a complete, restorable copy.
 
-## How the delete engine works (since 0.2.0)
+## How the delete engine works
 
-Deletion **no longer** goes through any kernel method — the old `internal/get` interceptor that wrapped `ctx.remote.session.deleteSession` is gone (upstream rc.2 has no such method; wrapping it threw `TypeError` right after the backup). The whole path is now this plugin's own:
+The whole deletion path lives inside this plugin and goes through no kernel method — upstream rc.2 has no `ctx.remote.session.deleteSession`, and this plugin does not depend on it:
 
 1. **Menu row** — registered on the official `sidebar.workspaces.session.menu.item` slot with a **double registration** so exactly one delete row ever renders on any kernel: `id: 'delete'` at `priority: -1` registers a component that renders `null`, shadowing the local alpha.3 kernel's built-in row regardless of registration order; `id: 'session-delete'`, `order: 460` registers this plugin's real row (right after 归档 / Archive). Upstream rc.2 has no kernel row, so the shadow is inert and the menu order matches alpha.3 exactly.
 2. **Confirm dialog** — injected into `shell.overlay`, opening the danger confirm up front (copy matches the kernel verbatim: permanent deletion of the log and caches, workspace files unaffected).
@@ -145,7 +143,7 @@ From npm:
 dsh plugin --profile <your-profile> add dsh-session-backup
 ```
 
-> ⚠️ npm currently publishes **0.1.1**, behind this repository (0.4.2): it lacks the self-hosted delete engine from 0.2.0 and every fix since — backup dedupe, refresh-and-pin on restore, and more. Install from GitHub or a local checkout for current behavior.
+> ⚠️ The npm publish may lag behind this repository. Install from GitHub or a local checkout to get the latest behavior.
 
 From GitHub (pin a tag or commit for a reproducible install):
 
