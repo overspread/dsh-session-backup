@@ -14,6 +14,8 @@ Backs up every session **before** the DeepSeek Harness Web GUI deletes it, adds 
 
 Batch delete reuses the same automatic backup, so a batch never removes a session that was not copied first. If a backup fails, the delete is refused and the error is shown — the only copy of a session never disappears because a backup could not be written.
 
+**Manual backup followed by deletion keeps one entry**: unchanged contents reuse a backup. If the log changed, deletion refreshes the latest backup at the same path after stopping and draining the Session, rather than adding another copy. The new copy is written and verified before replacing the old one; failures preserve the old backup and abort deletion. Backup requests for one Session are serialized, including concurrent manual and delete requests. Existing historical backups are not pruned.
+
 Blank placeholder rows (the provisional 新建会话 / New session row) and archived rows carry no checkbox: the harness renders neither a status slot nor its own actions for them, so they cannot be selected. They hold no conversation to preserve, and the next 新建会话 adopts the blank one.
 
 ## Where backups live
@@ -22,7 +24,7 @@ Blank placeholder rows (the provisional 新建会话 / New session row) and arch
 $DSH_HOME/backups/sessions/<sessionId>/<timestamp>-<title>/
 ├── session.v4.jsonl.zstd        # the session's own directory, copied verbatim
 ├── …
-└── backup.json                  # manifest: sessionId, title, createdAt, sourcePath, size
+└── backup.json                  # manifest: sessionId, title, createdAt, sourcePath, size, inventory (content fingerprint)
 ```
 
 The directory name is the local timestamp (`20261017-184533`) followed by the session's **current title**, sanitized for the filesystem (`/ \ : * ? " < > |` and control characters become spaces, capped at 48 characters, `untitled` when nothing usable remains). Two backups inside the same second get `-1`, `-2` … suffixes. `session.lock` and `.DS_Store` never enter a backup; the manifest's `backup.json` never leaves one on restore.
@@ -37,8 +39,8 @@ Deletion **no longer** goes through any kernel method — the old `internal/get`
 2. **Confirm dialog** — injected into `shell.overlay`, opening the danger confirm up front (copy matches the kernel verbatim: permanent deletion of the log and caches, workspace files unaffected).
 3. **Activity gate (409 upgrade)** — the host asks the `workspace/session-activity` waterfall (the same providers the kernel's archive gate uses). When work is active it answers `409 workspace/session-active` carrying the activity list — the client upgrades **the same dialog in place** to “停止并彻底删除此会话？ (Stop and delete this session?)” with the activity list and a “停止并删除 (Stop and delete)” button, matching the kernel's busy-upgrade behaviour byte for byte.
 4. **Stop path** — with `stopActivity: true` it first fires `workspace/session-stop` (stopping agent/jobs/subagent turns *and* purging every schedule row for the session), then quiesces the bare agent and detaches the entered store entry (firing `session/disposed`, which closes the write handle — rc.2 exposes no by-id `dispose()` capability, and this detach seam works on both versions), polls the gate until it answers empty, and only then probes the write lease. **A failed schedule-row purge aborts the whole deletion** (`gateway/internal`): a surviving armed row would cold-resume the log this cascade is destroying.
-5. **Cascade** — once the write lease is exclusive: remove the log directory (alpha.3 through the kernel's `remove()`; rc.2 has no `remove`, so the directory is located and `rm`'d with a post-verify), then best-effort spill / projection-cache / workspace-accounting cleanup (each seam feature-detected per version), then `ctx.emit('api-session/removed')` so the sidebar row disappears. Attachments are shared content-addressed blobs and are **never deleted** (spec A5); workspace folders and user files are untouched.
-6. **Backup first** — both single and batch deletes run `/api/session.backup.create` first; a genuine backup failure refuses the delete and shows the error — the only copy of a session never disappears because a backup could not be written — while “nothing to back up” and “no Host face mounted” both proceed.
+5. **Cascade** — once the write lease is exclusive: save the final backup, then remove the log directory (alpha.3 through the kernel's `remove()`; rc.2 has no `remove`, so the directory is located and `rm`'d with a post-verify), then best-effort spill / projection-cache / workspace-accounting cleanup (each seam feature-detected per version), then `ctx.emit('api-session/removed')` so the sidebar row disappears. Attachments are shared content-addressed blobs and are **never deleted** (spec A5); workspace folders and user files are untouched.
+6. **Backup first** — single and batch deletion call `/api/session.backup.delete` directly. The Host saves the final backup after stopping work and checking the writer, before removing the log. It refreshes the latest backup instead of adding a copy. A failed backup preserves the old copy and the live log and refuses deletion. Extra `.create` calls from cached clients also refresh the existing backup.
 
 Concurrent deletes of the same id share the first request's outcome (idempotent): a repeat answers success without re-running the cascade.
 
@@ -47,7 +49,7 @@ Semantics of a failed backup:
 | failure | result |
 | --- | --- |
 | backup route answers a real error (disk full, conflict, …) | delete **refused**, error dialog shown |
-| session has no directory left to back up | delete proceeds (nothing to copy), console note |
+| session has no directory left to back up | nothing to copy; a missing Session still returns 404 as before |
 | activity gate refusal (session is running) | 409 upgrades to the “Stop and delete” dialog for a second confirmation |
 | schedule-row purge fails | delete aborts (`gateway/internal`) so a timer cannot resurrect the log |
 
@@ -58,12 +60,12 @@ All five are registered on the Host connection below `/api`, address document-re
 | method | path | body | answers |
 | --- | --- | --- | --- |
 | `GET` | `/api/session.backup.list` | — | `{ backups: [...] }` newest first |
-| `POST` | `/api/session.backup.create` | `{ sessionId }` | `{ backup }` with `path`, `title`, `dirName`, `bytes`, `consistent` |
+| `POST` | `/api/session.backup.create` | `{ sessionId, beforeDelete? }` | `{ backup }` with `path`, `title`, `dirName`, `bytes`, `consistent`, `reused` (identical contents), `updated` (existing directory refreshed); refreshing the latest backup is the default, with explicit `beforeDelete: false` preserving an independent historical snapshot |
 | `POST` | `/api/session.backup.delete` | `{ sessionId, stopActivity? }` | `{ deleted }`; 409 + `details.activity` on an active refusal, 404 for an unknown id, 500 `gateway/internal` when the schedule purge fails |
-| `POST` | `/api/session.backup.restore` | `{ path }` | `{ restored }` with `attached`, `placement`, `workspaceId` / `reason`, `backupConsumed`; 409 if the session exists again (the backup is kept) |
+| `POST` | `/api/session.backup.restore` | `{ path }` | `{ restored }` with `attached`, `placement`, `workspaceId` / `reason`, `backupConsumed`, `pinned`; 409 if the session exists again (the backup is kept) |
 | `POST` | `/api/session.backup.remove` | `{ path }` | `{ removed }`; prunes an empty session group |
 
-`sessionId` must match a plain id pattern and every client-supplied path is checked to be strictly inside its root, so no request can reach outside the store. The title comes from the `sessionQuery` service (`readTitle`), falling back to `untitled` when it cannot be read. Before copying a live session the host flushes its in-memory log through the `sessions` service — the same barrier `dsh-session-log-export` uses — and each file's size is re-verified after the copy, so a log still being appended is re-copied and a copy that never settles is reported in the manifest (`consistent: false`) instead of silently shipping a torn file.
+`sessionId` must match a plain id pattern and every client-supplied path is checked to be strictly inside its root, so no request can reach outside the store. The title comes from the `sessionQuery` service (`readTitle`), falling back to `untitled` when it cannot be read. Before copying a live session the host flushes its in-memory log through the `sessions` service — the same barrier `dsh-session-log-export` uses — and each file's size is re-verified after the copy, so a log still being appended is re-copied and finally source and copy are compared using SHA-256. A changing source, flush failure, or copy failure rejects the request, preserves the old backup, and never publishes a partial copy.
 
 `readTitle` answers with either a bare string or the title provider's snapshot record (`{ title, source, eventSeq, … }`), depending on which query service the profile has; both are unwrapped, so backups are named after the title the Sidebar shows rather than a generic `untitled`.
 
@@ -74,6 +76,8 @@ Copying the directory back is only half of a restore. Deleting a session does tw
 So `restore` finishes by re-attaching the id through the harness's own API, `workspace.attachSession(sessionId)`. That call re-reads the restored session's header from persistence and refuses unless its `cwd` resolves to that Workspace's path, so the restore cannot attach a session to the wrong project.
 
 **A successful restore consumes its backup** (restore = take back; the response reports `backupConsumed: true`). The copy is kept only when the restore is refused (the session already exists → 409). Removal is best-effort: a failed prune never fails a restore that already succeeded, and `backupConsumed: false` reports it honestly.
+
+After a successful restore the client **refreshes the sidebar list immediately** (no manual reload) and **pins the session to the front of its group** — workspace groups and the native “Ungrouped” bucket alike, because the registry pin is global and its frame reaches the browser live. Pinning is best-effort: a refusal (e.g. an archived session) never fails a successful restore and is reported as `pinned: false`.
 
 A session with no matching Workspace does not disappear: rc.2's Sidebar has a native “Ungrouped” bucket, and sessions that belong to no Workspace are listed there (deleting a Workspace behaves the same way — its sessions move to Ungrouped). `placement` says where this restore landed:
 

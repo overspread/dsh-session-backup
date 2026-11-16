@@ -9,7 +9,9 @@
  * A backup is a recursive copy of the session's own directory plus a
  * `backup.json` manifest describing what was taken. Attachments are
  * content-addressed and are NOT purged when a session is deleted, so the
- * session directory alone is a complete, restorable copy.
+ * session directory alone is a complete, restorable copy. Identical contents
+ * reuse a stored copy. A delete refreshes the latest backup after stopping
+ * work, so a manual backup followed by deletion retains one up-to-date copy.
  *
  * The delete engine (below, `deleteSessionCascade`) reproduces the harness's
  * permanent-deletion cascade as a self-contained plugin, so a profile whose
@@ -21,7 +23,7 @@
  * `ctx.get()` and feature-detected at call time, so the same file runs on
  * both the local alpha.3 build (richer service APIs) and upstream rc.2.
  */
-import { copyFile, cp, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises'
+import { copyFile, cp, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, rmdir, stat, writeFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
@@ -41,7 +43,7 @@ export const inject = ['connection']
 const API_PATH = '/api/session.backup'
 /** Manifest filename carried inside every backup directory. */
 const MANIFEST_FILE = 'backup.json'
-const MANIFEST_VERSION = 1
+const MANIFEST_VERSION = 2
 /** Lease and cruft files that carry no session content. */
 const SKIP_NAMES = new Set(['session.lock', '.DS_Store'])
 /** Session ids are uuid-ish segments; anything else never reaches a path join. */
@@ -228,11 +230,9 @@ export async function flushLiveSession(ctx, sessionId) {
     return
   }
   if (session === undefined || session === null) return
-  try {
-    await store.flush(session)
-  } catch {
-    // A session that stopped between get() and flush() has nothing to push.
-  }
+  // A failed flush means the on-disk prefix may be stale. Abort the backup;
+  // the delete caller must never destroy the only up-to-date live copy.
+  await store.flush(session)
 }
 
 /** Read the session's current title, or undefined when it cannot be read. */
@@ -313,46 +313,164 @@ async function readManifest(dir) {
   return parsed
 }
 
-// ---------------------------------------------------------------------------
-// Store operations
-// ---------------------------------------------------------------------------
+/**
+ * Content fingerprint of one directory: sorted `relative/path:sha256` lines.
+ *
+ * A stored copy fingerprints like its source because lease and cruft files
+ * never enter a backup and `backup.json` is excluded here. Hashing bytes — not
+ * sizes — means only identical content reuses a backup; a source that kept
+ * appending mid-copy differs from its pre-copy fingerprint, and the manifest
+ * written after the copy records the destination's own fingerprint, which is
+ * what a later request compares against.
+ * @param root - session directory or stored backup directory to fingerprint.
+ * @returns sorted fingerprint lines, comparable with `every()`.
+ */
+async function inventoryOf(root) {
+  const files = await walkFiles(root)
+  const lines = []
+  for (const file of files) {
+    if (file.rel === MANIFEST_FILE) continue
+    const digest = createHash('sha256').update(await readFile(file.path)).digest('hex')
+    lines.push(`${file.rel}:${digest}`)
+  }
+  return lines.sort()
+}
+
+/** Read valid backups for this exact session and original location, newest first. */
+async function storedBackups(group, sessionId, source) {
+  let entries
+  try {
+    entries = await readdir(group, { withFileTypes: true })
+  } catch (error) {
+    if (error.code === 'ENOENT') return []
+    throw error
+  }
+  const copies = []
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue
+    const path = assertInside(group, join(group, entry.name), 'stored backup')
+    const manifest = await readManifest(path)
+    if (manifest?.sessionId !== sessionId || manifest.sourcePath !== source || manifest.consistent !== true) continue
+    copies.push({ ...manifest, dirName: entry.name, path })
+  }
+  return copies.sort((left, right) => right.createdAt.localeCompare(left.createdAt)
+    || right.dirName.localeCompare(left.dirName))
+}
+
+/** Serialize backup creation for one on-disk session group, including failed requests. */
+const backupWrites = new Map()
 
 /**
- * Copy one session's directory into the backup store.
- * @param ctx - Host context used for the flush barrier and title lookup.
+ * Copy or reuse one session backup. Before deletion, refresh the newest backup
+ * in place when the log changed; ordinary explicit snapshots retain history.
+ * A replacement is fully copied and verified before the old backup is moved.
+ * @param ctx - Host context for the flush barrier and title lookup.
  * @param sessionId - session to copy.
- * @param options - `{ home, sessionsRoot, backupRoot, title, stamp }` (tests set roots explicitly).
- * @returns the written manifest, plus `path` — the backup directory.
+ * @param options - roots, optional title/stamp, and beforeDelete (refresh newest).
+ * @returns the manifest and path, with reused/updated describing the result.
  */
 export async function createBackup(ctx, sessionId, options = {}) {
   assertSessionId(sessionId)
+  const backups = options.backupRoot ?? backupRoot(options.home ?? dshHome())
+  return withBackupGroup(resolve(backups, sessionId), () => createBackupNow(ctx, sessionId, options))
+}
+
+async function withBackupGroup(key, run) {
+  const previous = backupWrites.get(key) ?? Promise.resolve()
+  const operation = previous.catch(() => {}).then(run)
+  backupWrites.set(key, operation)
+  try {
+    return await operation
+  } finally {
+    if (backupWrites.get(key) === operation) backupWrites.delete(key)
+  }
+}
+
+/** Only a direct backup entry may be restored or removed, never staging or a whole group. */
+function backupGroupForPath(backups, path) {
+  const target = assertInside(backups, path, 'backup path')
+  const segments = relative(resolve(backups), target).split(sep)
+  if (segments.length !== 2) throw badRequest('backup path must name one backup entry')
+  const sessionId = assertSessionId(segments[0])
+  if (deleting.has(sessionId)) throw conflict('the session is being deleted; retry after deletion completes')
+  return dirname(target)
+}
+
+async function createBackupNow(ctx, sessionId, options) {
   const home = options.home ?? dshHome()
   const sessions = options.sessionsRoot ?? sessionsRoot(home)
   const backups = options.backupRoot ?? backupRoot(home)
   const source = await locateSessionDir(sessionId, sessions)
   if (source === undefined) throw notFound(`session "${sessionId}" has no directory under ${sessions}`)
   await flushLiveSession(ctx, sessionId)
+  const group = assertInside(backups, join(backups, sessionId), 'backup group')
+  const copies = await storedBackups(group, sessionId, source)
+  const wanted = await inventoryOf(source)
+  for (const copy of copies) {
+    const stored = await inventoryOf(copy.path)
+    if (stored.length === wanted.length && stored.every((line, index) => line === wanted[index])) {
+      return { ...copy, reused: true, updated: false }
+    }
+  }
+
+  const replacement = options.beforeDelete === true ? copies[0] : undefined
   const supplied = typeof options.title === 'string' && options.title.trim() !== '' ? options.title : undefined
   const title = supplied ?? (await readSessionTitle(ctx, sessionId)) ?? FALLBACK_TITLE
-  const dirName = await uniqueBackupName(backups, sessionId, options.stamp ?? timestamp(), title)
-  const group = join(backups, sessionId)
-  const destination = join(group, dirName)
-  await mkdir(group, { recursive: true })
-  const copied = await copySessionDir(source, destination)
-  const manifest = {
-    version: MANIFEST_VERSION,
-    sessionId,
-    title,
-    dirName,
-    createdAt: new Date().toISOString(),
-    sourcePath: source,
-    files: copied.files,
-    bytes: copied.bytes,
-    consistent: copied.inconsistent.length === 0,
-    inconsistent: copied.inconsistent,
+  const dirName = replacement?.dirName ?? await uniqueBackupName(backups, sessionId, options.stamp ?? timestamp(), title)
+  const destination = assertInside(group, join(group, dirName), 'backup destination')
+  // Staging is outside session groups, so list/match never expose partial copies.
+  const pendingRoot = join(backups, '.pending')
+  await mkdir(pendingRoot, { recursive: true })
+  const staging = assertInside(pendingRoot, await mkdtemp(join(pendingRoot, `${sessionId}-`)), 'backup staging')
+  const prepared = join(staging, 'new')
+  const previous = join(staging, 'previous')
+  let keepPrevious = false
+  try {
+    const copied = await copySessionDir(source, prepared)
+    const inventory = await inventoryOf(prepared)
+    const current = await inventoryOf(source)
+    if (copied.inconsistent.length > 0 || inventory.length !== current.length
+      || !inventory.every((line, index) => line === current[index])) {
+      throw conflict('session changed while its backup was copied; retry after the session becomes idle')
+    }
+    const manifest = {
+      version: MANIFEST_VERSION,
+      sessionId,
+      title,
+      dirName,
+      createdAt: new Date().toISOString(),
+      sourcePath: source,
+      files: copied.files,
+      bytes: copied.bytes,
+      consistent: true,
+      inconsistent: [],
+      inventory,
+    }
+    await writeFile(join(prepared, MANIFEST_FILE), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
+    await mkdir(group, { recursive: true })
+    if (replacement !== undefined) {
+      // Preserve the last good copy until the new one is published; failure rolls it back.
+      await rename(destination, previous)
+      keepPrevious = true
+      try {
+        await rename(prepared, destination)
+      } catch (error) {
+        try {
+          await rename(previous, destination)
+          keepPrevious = false
+        } catch (rollback) {
+          throw new AggregateError([error, rollback], `backup replacement failed; original retained at ${previous}`)
+        }
+        throw error
+      }
+      keepPrevious = false
+    } else {
+      await rename(prepared, destination)
+    }
+    return { ...manifest, path: destination, reused: false, updated: replacement !== undefined }
+  } finally {
+    if (!keepPrevious) await rm(staging, { recursive: true, force: true })
   }
-  await writeFile(join(destination, MANIFEST_FILE), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
-  return { ...manifest, path: destination }
 }
 
 /** Every backup on disk, newest first. */
@@ -365,7 +483,7 @@ export async function listBackups(root) {
     return backups
   }
   for (const group of groups) {
-    if (!group.isDirectory()) continue
+    if (!group.isDirectory() || group.name === '.pending') continue
     let entries
     try {
       entries = await readdir(join(root, group.name), { withFileTypes: true })
@@ -453,6 +571,12 @@ export async function reattachRestoredSession(registry, sessionId) {
 }
 
 export async function restoreBackup(path, options = {}) {
+  const backups = options.backupRoot ?? backupRoot(options.home ?? dshHome())
+  const group = backupGroupForPath(backups, path)
+  return withBackupGroup(group, () => restoreBackupNow(path, options))
+}
+
+async function restoreBackupNow(path, options) {
   const home = options.home ?? dshHome()
   const sessions = options.sessionsRoot ?? sessionsRoot(home)
   const backups = options.backupRoot ?? backupRoot(home)
@@ -472,13 +596,27 @@ export async function restoreBackup(path, options = {}) {
     filter: (entry) => basename(entry) !== MANIFEST_FILE && !SKIP_NAMES.has(basename(entry)),
   })
   const attachment = await reattachRestoredSession(options.registry, sessionId)
+  // Surface the restored Session ahead of every unpinned row: the registry's
+  // pin is registry-global (covers the native Ungrouped bucket too) and its
+  // `pinned` frame reaches the sidebar live. Best-effort — a restore that
+  // already succeeded never fails because a pin was refused (archived id).
+  let pinned = false
+  const registry = options.registry
+  if (registry !== undefined && typeof registry.pinSession === 'function') {
+    try {
+      await registry.pinSession(sessionId)
+      pinned = true
+    } catch (error) {
+      options.logger?.warn?.(`session-backup: restored but could not pin it: ${String(error)}`)
+    }
+  }
   // Restoring consumes the backup: the bytes are back at their live location, so
   // the copy is spent — restoring again would only be refused as a conflict
   // anyway. Removal is best-effort (a failed prune never fails a restore that
   // already succeeded) and reported through `backupConsumed`.
   let backupConsumed = false
   try {
-    await removeBackup(source, { home, backupRoot: backups })
+    await removeBackupNow(source, { home, backupRoot: backups })
     backupConsumed = true
   } catch (error) {
     options.logger?.warn?.(`session-backup: restored but could not remove the backup: ${String(error)}`)
@@ -489,12 +627,19 @@ export async function restoreBackup(path, options = {}) {
     target: destination,
     restoredAt: new Date().toISOString(),
     backupConsumed,
+    pinned,
     ...attachment,
   }
 }
 
 /** Delete one backup directory, pruning its session group once empty. */
 export async function removeBackup(path, options = {}) {
+  const backups = options.backupRoot ?? backupRoot(options.home ?? dshHome())
+  const group = backupGroupForPath(backups, path)
+  return withBackupGroup(group, () => removeBackupNow(path, options))
+}
+
+async function removeBackupNow(path, options) {
   const home = options.home ?? dshHome()
   const backups = options.backupRoot ?? backupRoot(home)
   const target = assertInside(backups, path, 'backup path')
@@ -502,8 +647,9 @@ export async function removeBackup(path, options = {}) {
   await rm(target, { recursive: true, force: true })
   const group = dirname(target)
   if (group !== backups) {
-    const remaining = await readdir(group).catch(() => [])
-    if (remaining.length === 0) await rm(group, { recursive: true, force: true }).catch(() => {})
+    await rmdir(group).catch((error) => {
+      if (error.code !== 'ENOENT' && error.code !== 'ENOTEMPTY') throw error
+    })
   }
   return { path: target, removedAt: new Date().toISOString() }
 }
@@ -669,12 +815,12 @@ async function quiesceAndDetach(ctx, sessionId) {
 /**
  * Flush every write handle, then prove exclusive ownership of the id's write
  * lease: a successful `open(id,'write')` means no other writer lives, and the
- * handle is closed at once so the removal below is the only writer. Busy is
+ * handle stays open across final backup and filesystem removal. Busy is
  * retried (a detach's lease retirement lands asynchronously) and, once
  * exhausted, refused as active with an empty activity list — exactly the
  * kernel's empty-activity lease refusal.
  */
-async function assertNoActiveWriter(ctx, sessionId) {
+async function acquireDeletionLease(ctx, sessionId) {
   const persistence = ctx.get('sessionPersistence')
   if (persistence === undefined || persistence === null) return
   if (typeof persistence.flush === 'function') {
@@ -707,16 +853,8 @@ async function assertNoActiveWriter(ctx, sessionId) {
       }
       if (attempt < BUSY_RETRY_ATTEMPTS) await sleep(BUSY_RETRY_DELAY_MS)
       continue
-    } finally {
-      if (handle !== undefined && typeof handle.close === 'function') {
-        try {
-          await handle.close()
-        } catch {
-          // A failed release only delays the rm below; the lease is ours anyway.
-        }
-      }
     }
-    return
+    return handle
   }
   throw busyError(sessionId, [])
 }
@@ -908,8 +1046,30 @@ async function runDelete(ctx, sessionId, stopActivity, explicitPaths) {
   }
 
   await disposeLiveAgent(ctx, sessionId)
-  await assertNoActiveWriter(ctx, sessionId)
-  await removeStored(ctx, sessionId, paths)
+  const backups = paths.backupRoot ?? backupRoot(paths.home ?? dshHome())
+  await withBackupGroup(resolve(backups, sessionId), async () => {
+    let lease = await acquireDeletionLease(ctx, sessionId)
+    try {
+      // Stop/detach may append closing events; capture them while no writer can
+      // re-enter. The same group lock prevents restore/remove consuming this copy.
+      if (await locateSessionDir(sessionId, paths.sessionsRoot) !== undefined) {
+        try {
+          await createBackupNow(ctx, sessionId, { ...paths, backupRoot: backups, beforeDelete: true })
+        } catch (error) {
+          throw internalError(sessionId, 'its final backup could not be saved; the session was not deleted', error)
+        }
+      }
+      // Older native remove APIs acquire their own deletion lock, so hand the
+      // write lease back immediately before entering that atomic native path.
+      if (typeof persistence?.remove === 'function' && typeof lease?.close === 'function') {
+        await lease.close()
+        lease = undefined
+      }
+      await removeStored(ctx, sessionId, paths)
+    } finally {
+      if (typeof lease?.close === 'function') await lease.close()
+    }
+  })
   removed.add(sessionId)
   const failed = await cascadeCaches(ctx, sessionId, paths)
   // The GUI's session list listens for this one; the row disappears without a
@@ -997,7 +1157,9 @@ export function apply(ctx, config = {}) {
         methods: ['POST'],
         requestBody: 'buffered',
         fetch: route(ctx, async (request, body) => ({
-          backup: await createBackup(ctx, assertSessionId(body?.sessionId), paths),
+          backup: await createBackup(ctx, assertSessionId(body?.sessionId), {
+            ...paths, beforeDelete: body?.beforeDelete !== false,
+          }),
         })),
       }),
       fetch.register({

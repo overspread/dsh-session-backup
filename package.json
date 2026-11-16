@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-backup",
-  "version": "0.3.0",
+  "version": "0.4.2",
   "description": "Backup every session before it is deleted, permanently delete sessions (spec-exact cascade: activity gate, schedule purge, log + caches, workspace accounting), batch-select sessions in the Web GUI, and restore a backup in one click",
   "keywords": [
     "deepseek-harness",
@@ -48,7 +48,7 @@
   },
   "scripts": {
     "build": "node scripts/build-client.mjs",
-    "test": "node test/delete-routes.mjs && node test/restore-route.mjs"
+    "test": "node test/delete-routes.mjs && node test/restore-route.mjs && node test/reuse-backup.mjs && node test/backup-delete-regression.mjs && node test/client-delete-flow.mjs"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.0.5-alpha.2"

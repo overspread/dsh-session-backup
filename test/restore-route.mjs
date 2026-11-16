@@ -105,6 +105,7 @@ async function runUngroupedAndConsume() {
   assert.equal(restored.placement, 'ungrouped', 'placement reports the ungrouped bucket')
   assert.equal(restored.attached, false, 'no workspace to attach to')
   assert.equal(restored.backupConsumed, true, 'restore consumes its backup')
+  assert.equal(restored.pinned, false, 'no registry means no pin attempt')
   assert.equal(await exists(home.dest), true, 'session files restored')
   assert.equal(await exists(home.backupDir), false, 'backup directory removed')
   assert.equal(await exists(home.group), false, 'empty session group pruned')
@@ -152,6 +153,7 @@ async function runAttached() {
         attachSession: async (sessionId) => calls.push(sessionId),
       },
     ],
+    pinSession: async (sessionId) => calls.push(`pin:${sessionId}`),
   }
   const { ctx, routes } = fakeCtx(registry)
   apply(ctx, { home: home.home })
@@ -162,15 +164,40 @@ async function runAttached() {
   assert.equal(restored.attached, true, 'session re-attached')
   assert.equal(restored.placement, 'workspace')
   assert.equal(restored.workspaceId, 'ws-1')
-  assert.deepEqual(calls, [SESSION], 'attachSession got the restored id')
+  assert.equal(restored.pinned, true, 'restore pins the session to the front of its group')
+  assert.deepEqual(calls, [SESSION, `pin:${SESSION}`], 'attachSession then pinSession got the restored id')
   assert.equal(restored.backupConsumed, true)
   assert.equal(await exists(home.backupDir), false, 'backup consumed')
   assert.equal(await exists(home.dest), true, 'files restored')
-  ok('[attached] re-attached to its workspace, backup consumed')
+  ok('[attached] re-attached to its workspace, pinned to the front, backup consumed')
+
+  await rm(home.home, { recursive: true, force: true })
+}
+
+/** A refused pin must never fail an already-successful restore. */
+async function runPinRefused() {
+  const home = await makeHome('pin-refused')
+  const registry = {
+    readSessionHeader: async () => ({ cwd: WORKSPACE }),
+    list: () => [{ id: 'ws-1', path: WORKSPACE, attachSession: async () => {} }],
+    pinSession: async () => { throw new Error('session is archived') },
+  }
+  const { ctx, routes } = fakeCtx(registry)
+  apply(ctx, { home: home.home })
+
+  const res = await post(routes, '/api/session.backup.restore', { path: home.backupDir })
+  assert.equal(res.status, 200, `pin refusal keeps restore successful (got ${res.status})`)
+  const restored = (await res.json()).restored
+  assert.equal(restored.attached, true, 'session still re-attached')
+  assert.equal(restored.pinned, false, 'pin failure reported instead of thrown')
+  assert.equal(await exists(home.dest), true, 'files restored')
+  assert.equal(await exists(home.backupDir), false, 'backup consumed')
+  ok('[attached] pin refusal is best-effort: restore still succeeds and consumes the backup')
 
   await rm(home.home, { recursive: true, force: true })
 }
 
 await runUngroupedAndConsume()
 await runAttached()
+await runPinRefused()
 console.log(process.exitCode ? '✗ FAIL' : '✓ all restore-route tests passed')

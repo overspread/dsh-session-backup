@@ -13,8 +13,9 @@
  *      that batches backup and delete — both through this plugin's own
  *      routes, never the kernel's `session/deleteSession` (absent upstream
  *      ≥ 0.2.1-alpha.5).
- *   3. An automatic backup taken just before any delete (single or batch): a
- *      failed backup refuses the delete instead of losing the only copy.
+ *   3. The Host takes the final backup after stopping the Session, before
+ *      deleting its files. An existing latest backup is refreshed instead of
+ *      creating an extra entry; failure prevents deletion.
  *   4. A backup manager dialog listing every stored backup with one-click
  *      restore and delete. A restore consumes its backup: the copy is removed
  *      once the bytes are back in the live location, and a session whose
@@ -62,7 +63,7 @@ const zh = {
   'menu.deselect': '移出选择',
   'menu.backup': '立即备份',
   'dialog.delete.title': '删除选中的会话？',
-  'dialog.delete.description': '将彻底删除 {count} 个会话。每个会话在删除前都会先自动备份到本地备份目录，之后可以在「备份」里一键恢复。',
+  'dialog.delete.description': '将删除选中的 {count} 个会话，正在运行的会话会跳过。删除前会保存最新内容，更新已有备份而不新增副本；之后可在「备份」里恢复。',
   'dialog.delete.confirm': '删除',
   'dialog.delete.cancel': '取消',
   'dialog.backups.title': '会话备份',
@@ -77,7 +78,11 @@ const zh = {
   'error.title': '操作失败',
   'error.dismiss': '知道了',
   'status.backupCreated': '已备份 {count} 个会话',
+  'status.backupOneReused': '内容与已有备份一致，未重复备份',
+  'status.backupUpdated': '已更新现有备份，未新增副本',
+  'status.backupManyReused': '这 {count} 个会话都已有一致的备份，未重复写入',
   'status.backupBeforeDelete': '已备份「{title}」',
+  'status.backupReusedDelete': '已有内容相同的备份，未重复备份「{title}」',
   'status.deleted': '已删除 {count} 个会话',
   'status.deletedWithSkipped': '已删除 {deleted} 个会话，{active} 个正在运行的已跳过',
   'status.activeSkipped': '{count} 个会话正在运行，未删除',
@@ -94,7 +99,7 @@ const zh = {
   'menu.deleteOne': '彻底删除…',
   'deleteOne.title': '彻底删除此会话？',
   'deleteOne.stopTitle': '停止并彻底删除此会话？',
-  'deleteOne.desc': '将永久删除“{title}”的会话日志与相关缓存数据（含溢出缓存），无法恢复；删除前会先自动备份到本地备份目录。工作区文件夹中的文件不受影响。',
+  'deleteOne.desc': '将删除“{title}”的会话日志与相关缓存数据。删除前会保存最新内容，更新已有备份而不新增副本；之后可在「备份」里恢复。工作区文件夹中的文件不受影响。',
   'deleteOne.activity': '删除前将停止的工作',
   'deleteOne.action': '删除',
   'deleteOne.stopAction': '停止并删除',
@@ -116,7 +121,7 @@ const en = {
   'menu.deselect': 'Remove from selection',
   'menu.backup': 'Back up now',
   'dialog.delete.title': 'Delete the selected sessions?',
-  'dialog.delete.description': 'This permanently deletes {count} sessions. Each one is backed up to the local backup directory first, and any backup can be restored in one click from “Backups”.',
+  'dialog.delete.description': 'Delete the {count} selected sessions, skipping any still running. Their latest contents are saved first, updating existing backups without adding another copy. Restore them from “Backups”.',
   'dialog.delete.confirm': 'Delete',
   'dialog.delete.cancel': 'Cancel',
   'dialog.backups.title': 'Session backups',
@@ -131,7 +136,11 @@ const en = {
   'error.title': 'Operation failed',
   'error.dismiss': 'Dismiss',
   'status.backupCreated': 'Backed up {count} sessions',
+  'status.backupOneReused': 'Already backed up identically; nothing new was written',
+  'status.backupUpdated': 'Updated the existing backup without adding another copy',
+  'status.backupManyReused': 'All {count} sessions already have identical backups; nothing new was written',
   'status.backupBeforeDelete': 'Backed up “{title}”',
+  'status.backupReusedDelete': 'An identical backup already existed; “{title}” was not copied again',
   'status.deleted': 'Deleted {count} sessions',
   'status.deletedWithSkipped': 'Deleted {deleted} sessions; skipped {active} still running',
   'status.activeSkipped': '{count} sessions are running and were not deleted',
@@ -148,7 +157,7 @@ const en = {
   'menu.deleteOne': 'Delete session…',
   'deleteOne.title': 'Permanently delete this session?',
   'deleteOne.stopTitle': 'Stop and delete this session?',
-  'deleteOne.desc': 'This permanently deletes the session log and related cached data for “{title}” (including spill caches) and cannot be undone; a backup is taken first. Files in the workspace folder are unaffected.',
+  'deleteOne.desc': 'This deletes the session log and related cached data for “{title}” after saving the latest contents. An existing backup is updated without adding another copy; restore it from “Backups”. Files in the workspace folder are unaffected.',
   'deleteOne.activity': 'Work that will be stopped before deletion',
   'deleteOne.action': 'Delete',
   'deleteOne.stopAction': 'Stop and delete',
@@ -376,22 +385,8 @@ function leaveIfCurrent(id) {
 
 /** Build the actions the injected components receive as props. */
 function createActions(ctx) {
-  /** Backup first (a failed backup refuses the delete; a missing directory or
-   * a profile with no Host routes only warns), then run the Host's cascade. */
+  /** The Host stops work, refreshes the existing backup, then deletes the log. */
   const deleteOne = async (sessionId, options = {}) => {
-    try {
-      const { backup } = await call('create', { sessionId })
-      store.setStatus({ key: 'status.backupBeforeDelete', params: { title: backup?.title ?? sessionId } })
-    } catch (error) {
-      const ignorable = error?.routeMissing === true || error?.code === 'session-backup/not-found'
-      if (!ignorable) {
-        const wrapped = new Error(`session backup failed: ${messageOf(error)}`)
-        wrapped.cause = error
-        wrapped.backupBlocked = true
-        throw wrapped
-      }
-      console.warn(`session-backup: no backup taken for ${sessionId} (${messageOf(error)})`)
-    }
     const payload = await call('delete', {
       sessionId,
       ...(options.stopActivity === true ? { stopActivity: true } : {}),
@@ -401,8 +396,12 @@ function createActions(ctx) {
 
   const backupOne = async (sessionId) => {
     try {
-      await call('create', { sessionId })
-      store.setStatus({ key: 'status.backupCreated', params: { count: 1 } })
+      const { backup } = await call('create', { sessionId })
+      store.setStatus({
+        key: backup?.reused === true ? 'status.backupOneReused'
+          : backup?.updated === true ? 'status.backupUpdated' : 'status.backupCreated',
+        params: { count: 1 },
+      })
     } catch (error) {
       store.fail({ key: 'error.requestFailed', params: { message: messageOf(error) } })
     }
@@ -411,8 +410,15 @@ function createActions(ctx) {
   const backupMany = async (sessionIds) => {
     if (sessionIds.length === 0) return
     try {
-      for (const sessionId of sessionIds) await call('create', { sessionId })
-      store.setStatus({ key: 'status.backupCreated', params: { count: sessionIds.length } })
+      let created = 0
+      for (const sessionId of sessionIds) {
+        const { backup } = await call('create', { sessionId })
+        if (backup?.reused !== true) created += 1
+      }
+      store.setStatus({
+        key: created === 0 ? 'status.backupManyReused' : 'status.backupCreated',
+        params: { count: sessionIds.length },
+      })
     } catch (error) {
       store.fail({ key: 'error.requestFailed', params: { message: messageOf(error) } })
     }
@@ -480,6 +486,10 @@ function createActions(ctx) {
             ? 'status.restoredDetached'
             : consumed ? 'status.restoredDone' : 'status.restored'
       store.setStatus({ key, params: { title, reason: restored.reason ?? '' } })
+      // The Host event feed only announces removals; a restore has no event,
+      // so push the sidebar list refresh here or the row appears only after
+      // the user reloads the page.
+      refreshList()
       await refreshBackups()
     } catch (error) {
       // The raw kernel sentence ("session … already exists at …") reads like a

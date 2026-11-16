@@ -14,6 +14,8 @@
 
 批量删除复用同一套自动备份逻辑，所以一批会话里绝不会有哪个没被先复制就删掉。如果备份失败，删除会被拒绝并显示错误 —— 会话的唯一副本绝不会因为备份写不出来而消失。
 
+**先备份再删除不会多出一份**：内容相同时直接复用已有备份；备份之后日志有变化时，删除会在停止与收尾完成后更新最新备份，保持同一路径和一个条目，不额外新增副本。新内容先复制并校验成功，才替换旧备份；写入失败保留旧备份并中止删除。同一会话的备份请求串行执行，手动备份和删除并发也不会各写一份。已有的历史备份不会被批量清除。
+
 空白占位行（临时的「新建会话」行）和已归档的行没有复选框：harness 不为它们渲染状态槽位也不渲染自己的操作，因此无法被选中。它们没有需要保留的对话，下一次「新建会话」会领养那个空白行。
 
 ## 备份存放位置
@@ -22,7 +24,7 @@
 $DSH_HOME/backups/sessions/<sessionId>/<timestamp>-<title>/
 ├── session.v4.jsonl.zstd        # 会话自身的目录，原样复制
 ├── …
-└── backup.json                  # 清单：sessionId、title、createdAt、sourcePath、size
+└── backup.json                  # 清单：sessionId、title、createdAt、sourcePath、size、inventory（内容指纹）
 ```
 
 目录名是本地时间戳（`20261017-184533`）加上会话的**当前标题**，并针对文件系统做了净化（`/ \ : * ? " < > |` 和控制字符替换为空格，最长 48 个字符，若无可用内容则为 `untitled`）。同一秒内的两次备份会得到 `-1`、`-2` … 后缀。`session.lock` 和 `.DS_Store` 永远不会进入备份；清单文件 `backup.json` 在恢复时也不会被复制回去。
@@ -37,8 +39,8 @@ $DSH_HOME/backups/sessions/<sessionId>/<timestamp>-<title>/
 2. **确认对话框**：注入 `shell.overlay`，空闲态直接打开 danger 确认（文案逐字对齐内核：永久删除日志与缓存、工作区文件不受影响）。
 3. **活动闸门（409 升级）**：宿主问 `workspace/session-activity` 瀑布（与内核归档同一组 provider）。有活动时返回 `409 workspace/session-active` 并携带活动清单 —— 客户端把**同一个对话框**原地升级为「停止并彻底删除此会话？」+ 活动列表 + 「停止并删除」按钮，与内核的 busy 升级行为逐字节一致。
 4. **停止路径**：`stopActivity: true` 时先发 `workspace/session-stop`（同时停 agent/jobs/subagent 回合并清掉该会话的全部 schedule 定时行），再 quiesce 裸 agent、detach 已进入的 store 条目（触发 `session/disposed` 关写句柄 —— rc.2 按 id 拿不到 `dispose()` capability，这条 detach 路是两版共通的），然后轮询等闸门转空，最后才探写租约。**schedule 行删除失败 = 整个删除中止**（`gateway/internal`），因为残留的定时投递会把日志冷恢复复活。
-5. **级联**：探到写租约独占 → 删日志目录（alpha.3 走内核 `remove()`，rc.2 无 `remove` 则定位目录 + `fs.rm` + 复检）→ best-effort 清 spill / 投影缓存 / 工作区记账（两版签名不同，各自特征检测）→ `ctx.emit('api-session/removed')` 让侧栏行消失。附件是共享内容寻址 blob，**永不删**（spec A5 裁定）；工作区目录与用户文件不动。
-6. **备份先行**：单个与批量删除都先走 `/api/session.backup.create`；备份真失败则删除被拒绝并显示错误 —— 会话的唯一副本绝不会因为备份写不出来而消失；只有「无目录可备份」和「profile 没挂 Host 面」才放行。
+5. **级联**：探到写租约独占 → 保存最终备份 → 删日志目录（alpha.3 走内核 `remove()`，rc.2 无 `remove` 则定位目录 + `fs.rm` + 复检）→ best-effort 清 spill / 投影缓存 / 工作区记账（两版签名不同，各自特征检测）→ `ctx.emit('api-session/removed')` 让侧栏行消失。附件是共享内容寻址 blob，**永不删**（spec A5 裁定）；工作区目录与用户文件不动。
+6. **备份先行**：单个与批量删除直接调用 `/api/session.backup.delete`，由 Host 在停止收尾与写者检查后保存最终备份，再删日志。已有最新备份会更新而非新增；备份失败则保留旧副本与会话日志并拒绝删除。旧客户端额外发出的 `.create` 也按更新已有备份处理。
 
 同 id 会话的并发删除共享第一次的结果（幂等），重复删除返回成功而不再次级联。
 
@@ -47,7 +49,7 @@ $DSH_HOME/backups/sessions/<sessionId>/<timestamp>-<title>/
 | 失败情形 | 结果 |
 | --- | --- |
 | 备份路由返回真实错误（磁盘满、冲突……） | 删除**被拒绝**，错误对话框显示原因 |
-| 会话已无目录可供备份 | 删除照常进行（无东西可复制），控制台提示 |
+| 会话已无目录可供备份 | 无可复制内容；不存在的会话仍按原语义返回 404 |
 | 活动闸门拒绝（会话正在运行） | 409 升级到「停止并彻底删除」对话框，等用户二次确认 |
 | schedule 定时行清理失败 | 删除中止（`gateway/internal`），防止日志被定时投递复活 |
 
@@ -58,12 +60,12 @@ $DSH_HOME/backups/sessions/<sessionId>/<timestamp>-<title>/
 | 方法 | 路径 | 请求体 | 响应 |
 | --- | --- | --- | --- |
 | `GET` | `/api/session.backup.list` | — | `{ backups: [...] }`，最新的在前 |
-| `POST` | `/api/session.backup.create` | `{ sessionId }` | `{ backup }`，含 `path`、`title`、`dirName`、`bytes`、`consistent` |
+| `POST` | `/api/session.backup.create` | `{ sessionId, beforeDelete? }` | `{ backup }`，含 `path`、`title`、`dirName`、`bytes`、`consistent`、`reused`（完全相同则复用）、`updated`（内容变化则更新原目录）；默认更新最新备份，显式 `beforeDelete: false` 才保留为独立历史快照 |
 | `POST` | `/api/session.backup.delete` | `{ sessionId, stopActivity? }` | `{ deleted }`；活动闸门拒绝时 409 + `details.activity`，未知 id 404，schedule 清理失败 500 `gateway/internal` |
-| `POST` | `/api/session.backup.restore` | `{ path }` | `{ restored }`，含 `attached`、`placement`、`workspaceId` / `reason`、`backupConsumed`；若会话已再次存在则返回 409（备份原样保留） |
+| `POST` | `/api/session.backup.restore` | `{ path }` | `{ restored }`，含 `attached`、`placement`、`workspaceId` / `reason`、`backupConsumed`、`pinned`（已置顶到分组最前，置顶被拒时为 `false`）；若会话已再次存在则返回 409（备份原样保留） |
 | `POST` | `/api/session.backup.remove` | `{ path }` | `{ removed }`；会顺带清理空的会话分组 |
 
-`sessionId` 必须匹配普通的 id 模式，且每一条客户端提供的路径都会被校验必须严格位于其根目录之内，因此任何请求都无法触及备份库之外。标题来自 `sessionQuery` 服务（`readTitle`），读不到时回退为 `untitled`。在复制一个正在运行的会话之前，host 会通过 `sessions` 服务把内存中的日志落盘 —— 与 `dsh-session-log-export` 使用的是同一道屏障 —— 并在复制后重新校验每个文件的大小，因此仍在追加的日志会被重新复制，而始终无法稳定的副本会在清单中被标记（`consistent: false`），而不是悄悄交付一个损坏的文件。
+`sessionId` 必须匹配普通的 id 模式，且每一条客户端提供的路径都会被校验必须严格位于其根目录之内，因此任何请求都无法触及备份库之外。标题来自 `sessionQuery` 服务（`readTitle`），读不到时回退为 `untitled`。在复制一个正在运行的会话之前，host 会通过 `sessions` 服务把内存中的日志落盘 —— 与 `dsh-session-log-export` 使用的是同一道屏障 —— 并在复制后重新校验每个文件的大小，因此仍在追加的日志会被重新复制，最终还会按 SHA-256 比较源与副本。若源持续变化、刷新或复制失败，请求报错且保留旧备份，不发布不完整副本。
 
 `readTitle` 的返回既可能是裸字符串，也可能是标题提供方的快照记录（`{ title, source, eventSeq, … }`），具体取决于该 profile 拥有哪种查询服务；两种形式都会被解包，所以备份会以侧边栏显示的标题命名，而不是一个笼统的 `untitled`。
 
@@ -74,6 +76,8 @@ $DSH_HOME/backups/sessions/<sessionId>/<timestamp>-<title>/
 所以 `restore` 最后会通过 harness 自己的 API 重新附加该 id：`workspace.attachSession(sessionId)`。该调用会从持久化层重新读取恢复后会话的头部，并且除非其 `cwd` 解析到该 Workspace 的路径，否则拒绝附加，因此恢复不会把会话挂到错误的项目上。
 
 **恢复成功后会删除该备份**（恢复 = 取回，响应里 `backupConsumed: true`）。只有恢复被拒绝时（会话已存在 → 409）备份才原样保留。删除是 best-effort：清理失败不会让一次已经成功的恢复失败，此时 `backupConsumed: false` 如实上报。
+
+恢复成功后，客户端会**立即刷新侧栏列表**（不需要手动刷新页面），并把该会话**置顶到其分组最前**——工作区组和「未分组」组都生效（registry pin 是全局的，置顶帧实时推给浏览器）。置顶是 best-effort：会话已归档等拒绝不影响恢复结果，此时响应里 `pinned: false`。
 
 没有匹配工作区的会话也不会消失：rc.2 的侧栏有原生的「未分组」分组，不属于任何工作区的会话显示在那里（删除一个工作区时也是同样行为 —— 它的会话进入「未分组」）。`placement` 说明这次恢复的落位：
 
