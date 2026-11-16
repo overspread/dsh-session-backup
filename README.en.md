@@ -2,21 +2,34 @@
 
 English | [中文](./README.md)
 
-Backs up every session **before** the DeepSeek Harness Web GUI deletes it, adds multi-select for batch delete/backup to the session list, and restores a backup in one click — all as a user plugin, without touching any installed harness file. From 0.2.0 **permanent deletion itself is also provided by this plugin** (the row-menu delete entry, the confirm dialog, and the cascade engine all live inside the plugin), so upgrading the harness can never take deletion away: upstream ≥ 0.2.1-alpha.5 has no kernel delete at all, and on the local alpha.3 build the kernel's delete row is shadowed — every version renders exactly this plugin's row.
+Backs up every session **before** the DeepSeek Harness Web GUI permanently deletes it, adds multi-select batch delete/backup to the session list, and restores a backup in one click — all as a user plugin, without touching any installed harness file.
+
+From 0.2.0 **permanent deletion itself is also provided by this plugin** (the row-menu delete entry, the confirm dialog, and the cascade engine all live inside the plugin), so upgrading the harness can never take deletion away: upstream ≥ 0.2.1-alpha.5 has no kernel delete at all, and on the local alpha.3 build the kernel's delete row is shadowed — every version renders exactly this plugin's row.
+
+Current version **0.4.2**.
 
 ## What you get
 
 | feature | where you see it |
 | --- | --- |
-| automatic backup on delete | nowhere — confirming **彻底删除… (Delete session…)** silently writes a backup first |
+| automatic backup on delete | nothing to do — confirming **Delete session…** silently saves the latest backup first; the log is removed only after that save succeeds |
 | multi-select + batch backup/delete | **多选 (Select)** in the sidebar footer, a checkbox on each row, and a **选择/加入选择** row in each session's "…" menu |
-| backup manager with one-click restore | **备份 (Backups)** in the sidebar footer. A successful restore consumes that backup (restore = take back); a session whose Workspace no longer exists appears under “Ungrouped” |
-
-Batch delete reuses the same automatic backup, so a batch never removes a session that was not copied first. If a backup fails, the delete is refused and the error is shown — the only copy of a session never disappears because a backup could not be written.
-
-**Manual backup followed by deletion keeps one entry**: unchanged contents reuse a backup. If the log changed, deletion refreshes the latest backup at the same path after stopping and draining the Session, rather than adding another copy. The new copy is written and verified before replacing the old one; failures preserve the old backup and abort deletion. Backup requests for one Session are serialized, including concurrent manual and delete requests. Existing historical backups are not pruned.
+| backup manager with one-click restore | **备份 (Backups)** in the sidebar footer. A successful restore takes the backup (restore = take back) and the session appears pinned at the front of its group; a session whose Workspace no longer exists appears under “Ungrouped” |
 
 Blank placeholder rows (the provisional 新建会话 / New session row) and archived rows carry no checkbox: the harness renders neither a status slot nor its own actions for them, so they cannot be selected. They hold no conversation to preserve, and the next 新建会话 adopts the blank one.
+
+## What the backup guarantees
+
+- **Back up before deleting** — single and batch deletion both save the **final backup** through the Host after stopping work and checking the writer, then remove the log, so a batch never removes a session that was not saved first. A failed backup preserves the old copy and the live log and refuses the delete with the reason; only “nothing to copy” and “no Host face mounted” proceed.
+- **One copy per content** — a per-file `relative path:sha256` fingerprint decides: an exact match **reuses** the existing backup (`reused: true`) with no new directory; changed content **refreshes the latest backup at the same path** (`updated: true`), so “back up manually, then delete” always leaves exactly one entry. The new copy is fully written and verified before replacing the old one; failures keep the old backup and abort the delete. Extra preflight requests from cached clients refresh the same way, and existing historical backups are never pruned in bulk.
+- **Concurrency-safe** — backup / restore / remove-backup requests for one session run serialized, so clicking a manual backup and a delete together never writes two copies.
+
+## Quick start
+
+1. Install (see [Install](#install) below), then restart `dsh web` once.
+2. **Back up**: a session's "…" menu → **Back up now**; tick several → **备份 (Back up selected)** in the sidebar footer.
+3. **Delete**: **彻底删除… (Delete session…)** — while the session is running, the dialog upgrades in place to “Stop and delete”; tick several → **删除选中 (Delete selected)**.
+4. **View / restore**: sidebar footer → **备份 (Backups)** → **恢复 (Restore)**. The session appears pinned at the front of its group and the sidebar refreshes itself — no manual reload.
 
 ## Where backups live
 
@@ -39,8 +52,8 @@ Deletion **no longer** goes through any kernel method — the old `internal/get`
 2. **Confirm dialog** — injected into `shell.overlay`, opening the danger confirm up front (copy matches the kernel verbatim: permanent deletion of the log and caches, workspace files unaffected).
 3. **Activity gate (409 upgrade)** — the host asks the `workspace/session-activity` waterfall (the same providers the kernel's archive gate uses). When work is active it answers `409 workspace/session-active` carrying the activity list — the client upgrades **the same dialog in place** to “停止并彻底删除此会话？ (Stop and delete this session?)” with the activity list and a “停止并删除 (Stop and delete)” button, matching the kernel's busy-upgrade behaviour byte for byte.
 4. **Stop path** — with `stopActivity: true` it first fires `workspace/session-stop` (stopping agent/jobs/subagent turns *and* purging every schedule row for the session), then quiesces the bare agent and detaches the entered store entry (firing `session/disposed`, which closes the write handle — rc.2 exposes no by-id `dispose()` capability, and this detach seam works on both versions), polls the gate until it answers empty, and only then probes the write lease. **A failed schedule-row purge aborts the whole deletion** (`gateway/internal`): a surviving armed row would cold-resume the log this cascade is destroying.
-5. **Cascade** — once the write lease is exclusive: save the final backup, then remove the log directory (alpha.3 through the kernel's `remove()`; rc.2 has no `remove`, so the directory is located and `rm`'d with a post-verify), then best-effort spill / projection-cache / workspace-accounting cleanup (each seam feature-detected per version), then `ctx.emit('api-session/removed')` so the sidebar row disappears. Attachments are shared content-addressed blobs and are **never deleted** (spec A5); workspace folders and user files are untouched.
-6. **Backup first** — single and batch deletion call `/api/session.backup.delete` directly. The Host saves the final backup after stopping work and checking the writer, before removing the log. It refreshes the latest backup instead of adding a copy. A failed backup preserves the old copy and the live log and refuses deletion. Extra `.create` calls from cached clients also refresh the existing backup.
+5. **Cascade** — once the write lease is exclusive (and held across the whole filesystem-delete path on the current rc.3 build): save the final backup, then remove the log directory (alpha.3 through the kernel's `remove()`; rc.2 has no `remove`, so the directory is located and `rm`'d with a post-verify), then best-effort spill / projection-cache / workspace-accounting cleanup (each seam feature-detected per version), then `ctx.emit('api-session/removed')` so the sidebar row disappears. Attachments are shared content-addressed blobs and are **never deleted** (spec A5); workspace folders and user files are untouched.
+6. **Backup first** — `/api/session.backup.delete` saves the final backup by that order before the log is removed; see [What the backup guarantees](#what-the-backup-guarantees) for the semantics — a failed backup preserves the old copy and the live log and refuses the delete, and closing events produced while stopping land in that one copy.
 
 Concurrent deletes of the same id share the first request's outcome (idempotent): a repeat answers success without re-running the cascade.
 
@@ -62,7 +75,7 @@ All five are registered on the Host connection below `/api`, address document-re
 | `GET` | `/api/session.backup.list` | — | `{ backups: [...] }` newest first |
 | `POST` | `/api/session.backup.create` | `{ sessionId, beforeDelete? }` | `{ backup }` with `path`, `title`, `dirName`, `bytes`, `consistent`, `reused` (identical contents), `updated` (existing directory refreshed); refreshing the latest backup is the default, with explicit `beforeDelete: false` preserving an independent historical snapshot |
 | `POST` | `/api/session.backup.delete` | `{ sessionId, stopActivity? }` | `{ deleted }`; 409 + `details.activity` on an active refusal, 404 for an unknown id, 500 `gateway/internal` when the schedule purge fails |
-| `POST` | `/api/session.backup.restore` | `{ path }` | `{ restored }` with `attached`, `placement`, `workspaceId` / `reason`, `backupConsumed`, `pinned`; 409 if the session exists again (the backup is kept) |
+| `POST` | `/api/session.backup.restore` | `{ path }` | `{ restored }` with `attached`, `placement`, `workspaceId` / `reason`, `backupConsumed`, `pinned` (`true` when pinned to the front of its group, `false` when the pin was refused); 409 if the session exists again (the backup is kept) |
 | `POST` | `/api/session.backup.remove` | `{ path }` | `{ removed }`; prunes an empty session group |
 
 `sessionId` must match a plain id pattern and every client-supplied path is checked to be strictly inside its root, so no request can reach outside the store. The title comes from the `sessionQuery` service (`readTitle`), falling back to `untitled` when it cannot be read. Before copying a live session the host flushes its in-memory log through the `sessions` service — the same barrier `dsh-session-log-export` uses — and each file's size is re-verified after the copy, so a log still being appended is re-copied and finally source and copy are compared using SHA-256. A changing source, flush failure, or copy failure rejects the request, preserves the old backup, and never publishes a partial copy.
@@ -83,7 +96,7 @@ A session with no matching Workspace does not disappear: rc.2's Sidebar has a na
 
 | `restored.placement` | meaning |
 | --- | --- |
-| `workspace` | re-attached; `workspaceId` names the Workspace and the session is back in its group (reload the page if the list was already open) |
+| `workspace` | re-attached; `workspaceId` names the Workspace and the session returns to its group pinned to the front (the sidebar refreshes itself — no manual reload) |
 | `ungrouped` | files restored; the session is listed under “Ungrouped” — no Workspace matches the log's `cwd` (e.g. its Workspace was deleted), or this profile has no `workspaceRegistry` |
 | `unknown` | rare: the restored header is unreadable, or `attachSession` refused — the files are back and `reason` says why |
 
@@ -108,6 +121,22 @@ node scripts/build-client.mjs   # regenerate client.js after editing src/client.
 
 The build rewrites each ESM import into a `require()` of the same specifier (`react` and `@deepseek-ai/dsh-client-ui-primitives` are seed words), strips `export` while recording the exported names, and fails loudly on Node built-ins, `export default`, or any form it cannot carry.
 
+## Tests
+
+```sh
+npm test
+```
+
+Five plain-Node suites running against system temp directories — **no harness, no real session, no network**:
+
+| suite | covers |
+| --- | --- |
+| `test/delete-routes.mjs` | the delete engine on both seam shapes (alpha.3 / rc.2), activity refusal and stop upgrade, write lease, idempotency |
+| `test/restore-route.mjs` | restore = take back (consumes the backup), workspace re-attach, pin and pin-refused |
+| `test/reuse-backup.mjs` | content-fingerprint reuse: unchanged content is never written twice |
+| `test/backup-delete-regression.mjs` | “back up then delete” leaves exactly one copy: changed content, concurrency, stop-time closing events, failed backup aborts the delete |
+| `test/client-delete-flow.mjs` | the browser-side request sequences of the real `createActions`: one delete call, sidebar refresh after restore |
+
 ## Install
 
 From npm:
@@ -115,6 +144,8 @@ From npm:
 ```sh
 dsh plugin --profile <your-profile> add dsh-session-backup
 ```
+
+> ⚠️ npm currently publishes **0.1.1**, behind this repository (0.4.2): it lacks the self-hosted delete engine from 0.2.0 and every fix since — backup dedupe, refresh-and-pin on restore, and more. Install from GitHub or a local checkout for current behavior.
 
 From GitHub (pin a tag or commit for a reproducible install):
 
