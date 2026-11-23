@@ -1,6 +1,7 @@
 /** Regression scenarios for manual backup followed by deletion, using real files and registered HTTP handlers. */
 import assert from 'node:assert/strict'
-import { appendFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat as fsstat, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { apply, backupRoot, createBackup, listBackups, removeBackup, restoreBackup } from '../index.js'
@@ -8,9 +9,11 @@ import { apply, backupRoot, createBackup, listBackups, removeBackup, restoreBack
 const cases = []
 const test = (name, run) => cases.push({ name, run })
 
+const exists = (p) => fsstat(p).then(() => true, () => false)
+
 async function fixture(run) {
   const home = await mkdtemp(join(tmpdir(), 'dsh-backup-regression-'))
-  const id = `session-${home.split('-').at(-1)}`
+  const id = `session-${randomUUID()}`
   const dir = join(home, 'sessions', 'project', id)
   const log = join(dir, 'session.v4.jsonl')
   await mkdir(dir, { recursive: true })
@@ -33,16 +36,19 @@ async function fixture(run) {
     effect: runEffect => runEffect(),
   }
   apply(ctx, options)
-  const post = async (action, body) => {
+  const postRaw = async (action, body) => {
     const response = await routes.get(`/api/session.backup.${action}`).fetch(new Request('http://localhost/', {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
     }))
-    const data = await response.json()
-    assert.equal(response.status, 200, JSON.stringify(data))
+    return { status: response.status, data: await response.json() }
+  }
+  const post = async (action, body) => {
+    const { status, data } = await postRaw(action, body)
+    assert.equal(status, 200, JSON.stringify(data))
     return data
   }
   const backups = () => listBackups(backupRoot(home))
-  try { await run({ home, id, dir, log, ctx, post, backups, options }) }
+  try { await run({ home, id, dir, log, ctx, post, postRaw, backups, options }) }
   finally {
     const target = await realpath(home)
     assert.ok(target.startsWith(`${await realpath(tmpdir())}/dsh-backup-regression-`))
@@ -201,6 +207,69 @@ test('remove and restore cannot consume a final backup while deletion is saving 
   } finally { resume(); await deletion }
   assert.equal((await f.backups()).length, 1)
   assert.equal(await readFile(join(first.path, 'session.v4.jsonl'), 'utf8'), 'original\nfinal content\n')
+}))
+
+// Half-deleted residues: the log directory vanished (an earlier delete died
+// between directory removal and cleanup) but the projection checkpoint / live
+// in-memory Session survived, so the Sidebar still lists a row every retry
+// answers 404 for. Such an id must be finished, not refused.
+test('half-deleted residue (log gone, projection cache left) is cleaned, not 404', () => fixture(async f => {
+  const cache = join(f.home, 'storages', 'session_projcache', 'sessions', `${f.id}.json`)
+  await mkdir(join(cache, '..'), { recursive: true })
+  await writeFile(cache, '{"rows":[]}')
+  await rm(f.dir, { recursive: true, force: true })
+  const events = []
+  f.ctx.emit = (name, id) => events.push({ name, id })
+  const body = await f.post('delete', { sessionId: f.id })
+  assert.deepEqual(body.deleted, { deleted: true, alreadyGone: true }, 'residue delete reports done-not-found')
+  assert.equal(await exists(cache), false, 'projection residue removed')
+  assert.deepEqual(events, [{ name: 'api-session/removed', id: f.id }], 'sidebar removal event emitted')
+  assert.equal((await f.backups()).length, 0, 'nothing to copy: no backup written for a vanished log')
+}))
+
+test('half-deleted residue with a live in-memory Session is detached and cleaned', () => fixture(async f => {
+  const persistence = f.ctx.get('sessionPersistence')
+  let detached = 0
+  const entry = { detach: () => { detached += 1 } }
+  const sessions = {
+    get: (id) => (id === f.id ? { id } : undefined),
+    store: { get: (id) => (id === f.id ? entry : undefined) },
+  }
+  f.ctx.get = (name) =>
+    name === 'sessionPersistence' ? persistence
+      : name === 'sessions' ? sessions
+        : undefined
+  await rm(f.dir, { recursive: true, force: true })
+  const events = []
+  f.ctx.emit = (name, id) => events.push({ name, id })
+  const body = await f.post('delete', { sessionId: f.id })
+  assert.deepEqual(body.deleted, { deleted: true, alreadyGone: true })
+  assert.equal(detached, 1, 'live store entry detached so the id stops being visible')
+  assert.deepEqual(events, [{ name: 'api-session/removed', id: f.id }], 'sidebar removal event emitted')
+  assert.equal((await f.backups()).length, 0)
+}))
+
+test('an id with no log and no residue is still refused as not found', () => fixture(async f => {
+  await rm(f.dir, { recursive: true, force: true })
+  const { status, data } = await f.postRaw('delete', { sessionId: f.id })
+  assert.equal(status, 404, 'a genuinely unknown id keeps the 404 refusal')
+  assert.equal(data.error.code, 'session/not-found')
+}))
+
+// The failure that stranded this session in the first place: cache cleanup was
+// best-effort AND ran after the log was already gone, so one failed step left a
+// Sidebar row no delete could ever reach. Cleanup now runs first and aborts.
+test('a failing cache step aborts the delete and leaves the log retryable', () => fixture(async f => {
+  const persistence = f.ctx.get('sessionPersistence')
+  f.ctx.get = (name) => name === 'sessionPersistence'
+    ? persistence
+    : name === 'sessionProjectionCache'
+      ? { invalidate: async () => { throw new Error('projection cache unavailable') } }
+      : undefined
+  const { status, data } = await f.postRaw('delete', { sessionId: f.id })
+  assert.equal(status, 500, 'a real cleanup failure refuses the delete')
+  assert.match(data.error.message, /could not be cleared/)
+  assert.equal(await exists(f.log), true, 'nothing is half-deleted: the log survives for a retry')
 }))
 
 let failures = 0

@@ -50,7 +50,7 @@ $DSH_HOME/backups/sessions/<sessionId>/<timestamp>-<title>/
 2. **确认对话框**：注入 `shell.overlay`，空闲态直接打开 danger 确认（文案逐字对齐内核：永久删除日志与缓存、工作区文件不受影响）。
 3. **活动闸门（409 升级）**：宿主问 `workspace/session-activity` 瀑布（与内核归档同一组 provider）。有活动时返回 `409 workspace/session-active` 并携带活动清单 —— 客户端把**同一个对话框**原地升级为「停止并彻底删除此会话？」+ 活动列表 + 「停止并删除」按钮，与内核的 busy 升级行为逐字节一致。
 4. **停止路径**：`stopActivity: true` 时先发 `workspace/session-stop`（同时停 agent/jobs/subagent 回合并清掉该会话的全部 schedule 定时行），再 quiesce 裸 agent、detach 已进入的 store 条目（触发 `session/disposed` 关写句柄 —— rc.2 按 id 拿不到 `dispose()` capability，这条 detach 路是两版共通的），然后轮询等闸门转空，最后才探写租约。**schedule 行删除失败 = 整个删除中止**（`gateway/internal`），因为残留的定时投递会把日志冷恢复复活。
-5. **级联**：探到写租约独占（并在当前 rc.3 的文件系统删除路径上**全程持有写租约**）→ 保存最终备份 → 删日志目录（alpha.3 走内核 `remove()`，rc.2 无 `remove` 则定位目录 + `fs.rm` + 复检）→ best-effort 清 spill / 投影缓存 / 工作区记账（两版签名不同，各自特征检测）→ `ctx.emit('api-session/removed')` 让侧栏行消失。附件是共享内容寻址 blob，**永不删**（spec A5 裁定）；工作区目录与用户文件不动。
+5. **级联**：探到写租约独占（并在当前 rc.3 的文件系统删除路径上**全程持有写租约**）→ 保存最终备份 → **先清 spill / 投影缓存 / 工作区记账**（两版签名不同，各自特征检测）→ **最后**删日志目录（alpha.3 走内核 `remove()`，rc.2 无 `remove` 则定位目录 + `fs.rm` + 复检）→ `ctx.emit('api-session/removed')` 让侧栏行消失。缓存清理**不是** best-effort：任何一步真失败都会中止删除、保留日志，绝不出现「日志已删、缓存还在」的半删残留。附件是共享内容寻址 blob，**永不删**（spec A5 裁定）；工作区目录与用户文件不动。
 6. **备份先行**：`/api/session.backup.delete` 按上面的顺序在删除日志前保存最终备份，语义见 [备份保证](#备份保证) —— 备份失败时保留旧副本与会话日志并拒绝删除，停止时新产生的收尾事件也进入这一份备份。
 
 同 id 会话的并发删除共享第一次的结果（幂等），重复删除返回成功而不再次级联。
@@ -60,6 +60,7 @@ $DSH_HOME/backups/sessions/<sessionId>/<timestamp>-<title>/
 | 失败情形 | 结果 |
 | --- | --- |
 | 备份路由返回真实错误（磁盘满、冲突……） | 删除**被拒绝**，错误对话框显示原因 |
+| 缓存清理某一步失败 | 删除中止（500），日志**原样保留**，可直接重试；不会留下半删残留 |
 | 会话已无目录可供备份 | 无可复制内容；不存在的会话仍按原语义返回 404 |
 | 活动闸门拒绝（会话正在运行） | 409 升级到「停止并彻底删除」对话框，等用户二次确认 |
 | schedule 定时行清理失败 | 删除中止（`gateway/internal`），防止日志被定时投递复活 |

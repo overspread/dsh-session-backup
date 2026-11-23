@@ -993,6 +993,32 @@ export async function deleteSessionCascade(ctx, sessionId, options = {}) {
   }
 }
 
+/**
+ * Any trace of the id left after its log directory vanished: a live in-memory
+ * Session, its projection checkpoint, or workspace accounting. A delete that
+ * only checks disk answers 404 for such a half-deleted residue and strands a
+ * row the Sidebar still lists forever, so this decides between "clean up the
+ * leftovers" and a genuine not-found refusal.
+ */
+async function hasResidual(ctx, sessionId, paths) {
+  try {
+    const live = ctx.get('sessions')?.get?.(sessionId)
+    if (live !== undefined && live !== null) return true
+  } catch {
+    // a store that cannot answer falls through to the on-disk probes
+  }
+  const storages = paths.storagesRoot ?? join(paths.home ?? dshHome(), 'storages')
+  if (await pathExists(join(storages, 'session_projcache', 'sessions', `${sessionId}.json`))) return true
+  const registry = ctx.get('workspaceRegistry')
+  if (registry !== undefined && registry !== null && typeof registry.list === 'function') {
+    for (const workspace of registry.list()) {
+      const members = Reflect.get(workspace, 'sessionIds')
+      if (Array.isArray(members) && members.includes(sessionId)) return true
+    }
+  }
+  return false
+}
+
 async function runDelete(ctx, sessionId, stopActivity, explicitPaths) {
   const paths = explicitPaths ?? deletePaths()
   const persistence = ctx.get('sessionPersistence')
@@ -1003,9 +1029,15 @@ async function runDelete(ctx, sessionId, stopActivity, explicitPaths) {
       : undefined
     if (still === undefined || still === null) return { deleted: true }
   }
+  // A missing log is either a genuinely unknown id (refuse) or a half-deleted
+  // residue whose row the Sidebar still shows (finish the cleanup below).
+  let orphaned = false
   if (persistence !== undefined && persistence !== null && typeof persistence.stat === 'function') {
     const snapshot = await persistence.stat(sessionId).catch(() => undefined)
-    if (snapshot === undefined || snapshot === null) throw notFoundError(sessionId)
+    if (snapshot === undefined || snapshot === null) {
+      if (!(await hasResidual(ctx, sessionId, paths))) throw notFoundError(sessionId)
+      orphaned = true
+    }
   }
 
   if (stopActivity) {
@@ -1046,6 +1078,23 @@ async function runDelete(ctx, sessionId, stopActivity, explicitPaths) {
   }
 
   await disposeLiveAgent(ctx, sessionId)
+  // Cache cleanup runs BEFORE the log leaves the disk, and it is no longer
+  // swallowed: a step that fails aborts the delete while the Session is still
+  // whole and retryable. Removing the log first and merely warning on later
+  // failures produced the half-deleted residue this plugin used to 404 on —
+  // a dangling Sidebar row whose only log was already gone.
+  const failed = await cascadeCaches(ctx, sessionId, paths)
+  if (failed.length > 0) {
+    throw internalError(sessionId, `its ${failed.join(', ')} could not be cleared; the session was not deleted`, new Error('cache cleanup failed'))
+  }
+  if (orphaned) {
+    // No log left: the activity gate above already stopped work and detached
+    // the live entry, and the cache cascade just ran. The only work left is the
+    // event the Sidebar waits on, so a half-deleted id disappears.
+    removed.add(sessionId)
+    emitRemoved(ctx, sessionId)
+    return { deleted: true, alreadyGone: true }
+  }
   const backups = paths.backupRoot ?? backupRoot(paths.home ?? dshHome())
   await withBackupGroup(resolve(backups, sessionId), async () => {
     let lease = await acquireDeletionLease(ctx, sessionId)
@@ -1071,18 +1120,22 @@ async function runDelete(ctx, sessionId, stopActivity, explicitPaths) {
     }
   })
   removed.add(sessionId)
-  const failed = await cascadeCaches(ctx, sessionId, paths)
-  // The GUI's session list listens for this one; the row disappears without a
-  // full refresh (the kernel emits it on the same removal).
+  emitRemoved(ctx, sessionId)
+  return { deleted: true }
+}
+
+/**
+ * Tell the GUI's session list the row is gone (it listens for this one, so the
+ * row disappears without a full refresh — the kernel emits it on the same
+ * removal). Never throws: a listener failure must not turn a completed delete
+ * into an error the user retries.
+ */
+function emitRemoved(ctx, sessionId) {
   try {
     ctx.emit?.('api-session/removed', sessionId)
   } catch (error) {
     ctx.logger?.warn?.(`session-backup: removed-event for '${sessionId}' failed: ${String(error)}`)
   }
-  if (failed.length > 0) {
-    ctx.logger?.warn?.(`session-backup: '${sessionId}' deleted with residual cache steps: ${failed.join(', ')}`)
-  }
-  return { deleted: true }
 }
 
 /** Resolve every root this cascade touches from the current home. */
