@@ -37,9 +37,12 @@ jobs:
             exit 1
           fi
 
-      - name: Install
-        run: npm ci --ignore-scripts
-
+      # No install step: the package has no dependencies or devDependencies to
+      # lock (its only peer requirement is @deepseek-ai/cordis, supplied by the
+      # Host at runtime), and both the build and every test are plain Node with
+      # no install tree. Adding `npm ci` would need a lockfile this repo has no
+      # reason to hold, and it cannot resolve peer dependencies anyway.
+      #
       # client.js is generated from src/client.mjs and ships in the tarball, so
       # build first and fail the release if the committed bundle is stale.
       - name: Build the client bundle
