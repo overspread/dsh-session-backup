@@ -183,3 +183,19 @@ The package has no runtime dependencies; run the build before packing so the tar
 [MIT](./LICENSE) © overspread.
 
 This is a personal, community plugin. It is not developed, endorsed, or supported by DeepSeek, and it is not part of the DeepSeek Harness distribution. It only reads and writes inside your own `$DSH_HOME`; review the source before installing, as with any third-party plugin that runs on your machine.
+
+## Automated npm releases
+
+Releases run in GitHub Actions; no local `npm publish` or OTP is needed. Tag to release:
+
+```sh
+# bump `version` in package.json first, then tag the same version
+git tag v0.4.4
+git push origin v0.4.4
+```
+
+`.github/workflows/publish.yml` verifies the tag matches `package.json`, runs `npm ci`, builds `client.js` and fails when the committed bundle is stale, runs the tests, publishes with `npm publish --provenance`, then triggers an npmmirror sync.
+
+Configure a **Trusted Publisher** once on the package's npmjs.com settings page: repository `overspread/dsh-session-backup`, workflow filename `publish.yml`. CI then publishes through a short-lived OIDC credential — no long-lived npm token, no local 2FA.
+
+A manual `npm publish` still works; it asks for the one-time password.

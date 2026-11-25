@@ -183,3 +183,19 @@ git push --follow-tags
 [MIT](./LICENSE) © overspread。
 
 这是一个个人的社区插件。它不由 DeepSeek 开发、背书或支持，也不是 DeepSeek Harness 发行版的一部分。它只在你自己的 `$DSH_HOME` 内读写；像任何会在你机器上运行的第三方插件一样，安装前请审阅源码。
+
+## 自动发布到 npm
+
+发布由 GitHub Actions 完成，本地不需要 `npm publish` 或验证码。打 tag 即发布：
+
+```sh
+# 先改 package.json 的 version，再打同名 tag
+git tag v0.4.4
+git push origin v0.4.4
+```
+
+工作流 `.github/workflows/publish.yml` 会依次：校验 tag 与 `package.json` 版本一致 → `npm ci` → 构建 `client.js` 并检查它未过期 → 跑测试 → 以 `npm publish --provenance` 发布 → 触发 npmmirror 同步。
+
+需要先在 npmjs.com 该包设置里添加 **Trusted Publisher**：仓库 `overspread/dsh-session-backup`，工作流文件名 `publish.yml`。之后 CI 用 OIDC 短期凭据发布，无需任何长期 npm token，也无需本机 2FA。
+
+手动发布仍然可用（`npm publish`），会要求输入验证码。

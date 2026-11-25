@@ -1,0 +1,70 @@
+name: publish
+
+# Releases come from tags, not from pushes to main:
+#   git tag v0.4.4 && git push origin v0.4.4
+# The tag names what shipped; package.json carries the version npm sees, and
+# the guard below refuses to publish when the two disagree.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  # npm Trusted Publishing exchanges this short-lived OIDC token for publish
+  # rights scoped to this repository. No long-lived npm token is stored.
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          # Trusted Publishing needs the public registry: the OIDC exchange is
+          # not available through a mirror.
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Verify the tag matches package.json
+        run: |
+          tagged="${GITHUB_REF_NAME#v}"
+          declared="$(node -p 'require("./package.json").version')"
+          if [ "$tagged" != "$declared" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match package.json version ${declared}" >&2
+            exit 1
+          fi
+
+      - name: Install
+        run: npm ci --ignore-scripts
+
+      # client.js is generated from src/client.mjs and ships in the tarball, so
+      # build first and fail the release if the committed bundle is stale.
+      - name: Build the client bundle
+        run: npm run build
+
+      - name: Fail when the committed bundle is out of date
+        run: |
+          if ! git diff --quiet -- client.js; then
+            echo "client.js is stale: run npm run build and commit the result" >&2
+            git diff --stat -- client.js >&2
+            exit 1
+          fi
+
+      - name: Test
+        run: npm test
+
+      - name: Publish to npm
+        run: npm publish --provenance --access public
+
+      # A fresh release reaches registry.npmjs.org first; npmmirror only learns
+      # of it when asked. Without this nudge, installs through the mirror keep
+      # resolving the previous version for minutes to hours.
+      - name: Sync the release to npmmirror
+        run: |
+          encoded="$(node -p "encodeURIComponent(require('./package.json').name)")"
+          curl --fail --silent --show-error --retry 3 --retry-delay 10 \
+            "https://registry.npmmirror.com/-/package/${encoded}/syncs" \
+            || echo "npmmirror sync request failed; the mirror will catch up on its own schedule"
