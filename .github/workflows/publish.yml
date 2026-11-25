@@ -60,7 +60,7 @@ jobs:
         run: npm test
 
       - name: Publish to npm
-        run: npm publish --provenance --access public
+        run: npm publish --provenance
 
       # A fresh release reaches registry.npmjs.org first; npmmirror only learns
       # of it when asked. Without this nudge, installs through the mirror keep
