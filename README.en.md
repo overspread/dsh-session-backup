@@ -1,6 +1,6 @@
 # dsh-session-backup
 
-English | [中文](./README.md)
+English | [中文](./README.md) · [Changelog](./CHANGELOG.md)
 
 Backs up every session **before** the DeepSeek Harness Web GUI permanently deletes it, adds multi-select batch delete/backup to the session list, and restores a backup in one click — all as a user plugin, without touching any installed harness file.
 
@@ -21,6 +21,18 @@ Blank placeholder rows (the provisional 新建会话 / New session row) and arch
 - **Back up before deleting** — single and batch deletion both save the **final backup** through the Host after stopping work and checking the writer, then remove the log, so a batch never removes a session that was not saved first. A failed backup preserves the old copy and the live log and refuses the delete with the reason; only “nothing to copy” and “no Host face mounted” proceed.
 - **One copy per content** — a per-file `relative path:sha256` fingerprint decides: an exact match **reuses** the existing backup (`reused: true`) with no new directory; changed content **refreshes the latest backup at the same path** (`updated: true`), so “back up manually, then delete” always leaves exactly one entry. The new copy is fully written and verified before replacing the old one; failures keep the old backup and abort the delete. A repeated backup request refreshes the same way, and existing historical backups are never pruned in bulk.
 - **Concurrency-safe** — backup / restore / remove-backup requests for one session run serialized, so clicking a manual backup and a delete together never writes two copies.
+
+## Optional session temporary-file cleanup
+
+Open **Temporary files** beside **Backups** in the sidebar footer to enable cleanup of registered temporary files on session deletion. It is **off by default**. The plugin saves `cleanupOnDelete` through its configuration editor for both individual and batch deletion; an unavailable or rejected save is reported.
+
+Only files allocated by a producer through `ctx.get('sessionArtifacts').save(sessionId, filename, bytes)` are eligible. Objects live under `$DSH_HOME/session-artifacts/objects/<sessionId>/`, with separate ownership ledgers in `session-artifacts/registry/`. The API accepts content bytes, never an existing file path. **Existing screenshots, arbitrary shell outputs, and older unregistered session files are not imported automatically**; producers must adopt the API.
+
+After the final backup succeeds, deletion records cleanup intent and removes artifacts only after confirming the session log is gone. Failed inventories survive restarts and can be retried under **Temporary files → Retry pending cleanup** after verifying session absence again. Restoring a session cancels its pending marker; a reset failure returns `cleanupWarning` while completing restoration.
+
+Workspace files, shared attachments, and backups are excluded. Modified or replaced files, links, and unsafe permissions cause retention. Temporary artifacts **are not included in session backups and cannot be recovered by restoring a session after cleanup**. Only one Host process may write the registry.
+
+See the [changelog](./CHANGELOG.md) for plugin releases. Screenshot producer integration and DSH core per-version release notes still require the core source project and are not supplied by this plugin.
 
 ## Quick start
 
@@ -67,7 +79,7 @@ Semantics of a failed backup:
 
 ## HTTP routes
 
-All five are registered on the Host connection below `/api`, address document-relative by the browser (`.slice(1)`), and answer JSON:
+All seven route paths are registered on the Host connection below `/api`, address document-relative by the browser (`.slice(1)`), and answer JSON:
 
 | method | path | body | answers |
 | --- | --- | --- | --- |
@@ -76,6 +88,8 @@ All five are registered on the Host connection below `/api`, address document-re
 | `POST` | `/api/session.backup.delete` | `{ sessionId, stopActivity? }` | `{ deleted }`; 409 + `details.activity` on an active refusal, 404 for an unknown id, 500 `gateway/internal` when the schedule purge fails |
 | `POST` | `/api/session.backup.restore` | `{ path }` | `{ restored }` with `attached`, `placement`, `workspaceId` / `reason`, `backupConsumed`, `pinned` (`true` when pinned to the front of its group, `false` when the pin was refused); 409 if the session exists again (the backup is kept) |
 | `POST` | `/api/session.backup.remove` | `{ path }` | `{ removed }`; prunes an empty session group |
+| `GET` / `POST` | `/api/session.backup.cleanup-settings` | none for GET; `{ cleanupOnDelete: boolean }` to save | `{ settings: { cleanupOnDelete, editable, pending } }`; 409 when configuration cannot be saved |
+| `POST` | `/api/session.backup.cleanup-retry` | `{}` | `{ results, settings }`; retries only marked inventories with verified session absence, 409 while cleanup is disabled |
 
 `sessionId` must match a plain id pattern and every client-supplied path is checked to be strictly inside its root, so no request can reach outside the store. The title comes from the `sessionQuery` service (`readTitle`), falling back to `untitled` when it cannot be read. Before copying a live session the host flushes its in-memory log through the `sessions` service — the same barrier `dsh-session-log-export` uses — and each file's size is re-verified after the copy, so a log still being appended is re-copied and finally source and copy are compared using SHA-256. A changing source, flush failure, or copy failure rejects the request, preserves the old backup, and never publishes a partial copy.
 
@@ -126,7 +140,7 @@ The build rewrites each ESM import into a `require()` of the same specifier (`re
 npm test
 ```
 
-Five plain-Node suites running against system temp directories — **no harness, no real session, no network**:
+Nine plain-Node suites running against system temp directories — **no harness, no real session, no network**:
 
 | suite | covers |
 | --- | --- |
@@ -135,6 +149,10 @@ Five plain-Node suites running against system temp directories — **no harness,
 | `test/reuse-backup.mjs` | content-fingerprint reuse: unchanged content is never written twice |
 | `test/backup-delete-regression.mjs` | “back up then delete” leaves exactly one copy: changed content, concurrency, stop-time closing events, failed backup aborts the delete |
 | `test/client-delete-flow.mjs` | the browser-side request sequences of the real `createActions`: one delete call, sidebar refresh after restore |
+| `test/artifacts.mjs` | durable ownership, retention of modified files and links, concurrent saves and cleanup across instances |
+| `test/cleanup-routes.mjs` | default-off policy, backup before cleanup, failed cleanup retries, restore protection, configuration saves |
+| `test/client-cleanup-flow.mjs` | settings persistence and failures, retry results, adjacent footer entry and disabled controls |
+| `test/cleanup-concurrency.mjs` | log state rechecked after a queued restore, successful restoration despite a corrupt cleanup marker |
 
 ## Install
 

@@ -64,5 +64,12 @@ jobs:
         run: npm test
 
       # A maintainer approves the staged version on npm with 2FA before it goes live.
+      # Keep prereleases on preview so they never replace the stable latest tag.
       - name: Stage the package on npm
-        run: npm stage publish --provenance
+        run: |
+          version="$(node -p 'require("./package.json").version')"
+          tag=latest
+          if [[ "$version" == *-* ]]; then
+            tag=preview
+          fi
+          npm stage publish --provenance --tag "$tag"

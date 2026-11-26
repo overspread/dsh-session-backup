@@ -1,6 +1,6 @@
 # dsh-session-backup
 
-中文 | [English](./README.en.md)
+中文 | [English](./README.en.md) · [更新日志](./CHANGELOG.md)
 
 在 DeepSeek Harness Web 里**彻底删除会话前自动备份**，为会话列表加上多选批量删除/批量备份，并支持一键恢复备份 —— 全部以用户插件实现，不改动任何已安装的 harness 文件。
 
@@ -21,6 +21,18 @@
 - **先备份、后删除**：单个与批量删除都由 Host 在停止收尾并检查写者之后保存**最终备份**，再删日志 —— 批量里绝不会有哪个会话没被先保存就删掉。备份失败则保留旧副本与实时日志，删除被拒绝并显示原因；只有「无目录可备份」和 profile 未挂 Host 面才放行。
 - **同一份内容只留一份**：以内容指纹（逐文件「相对路径:sha256」）比对，完全一致 → 直接复用已有备份（`reused: true`），不新增目录；内容有变化 → 更新最新备份的**同一路径**（`updated: true`），所以「先手动备份、再点删除」始终只有一份。新副本先完整写入并校验成功才替换旧副本，失败则保留旧备份并中止删除。重复的备份请求一律按更新处理，已有的历史备份不会被批量清理。
 - **并发安全**：同一会话的备份 / 恢复 / 删除备份请求串行执行，手动备份和删除同时点也不会各写一份。
+
+## 可选的会话临时文件清理
+
+侧栏底部 **备份** 旁的 **临时文件** 可设置“删除会话时清理已登记临时文件”，**默认关闭**。设置由插件配置 `cleanupOnDelete` 保存，对单个和批量删除均生效。配置不可编辑时会说明原因，不会假报保存成功。
+
+只清理由生成方通过 `ctx.get('sessionArtifacts').save(sessionId, filename, bytes)` 新建并登记的文件，存放在 `$DSH_HOME/session-artifacts/objects/<sessionId>/`；归属清单独立保存在 `session-artifacts/registry/`。接口接收内容字节，不接受已有文件路径。**已有截图、任意 shell 生成文件和旧会话未登记文件不会自动纳入清理**，生成方需要主动接入接口。
+
+最终备份成功后记录待清理标记，确认会话日志删除成功后才清理临时文件。失败记录跨重启保留，可在 **临时文件 → 重试待清理文件** 重试；重试会再次确认会话不存在。恢复会话会取消待清理标记，取消失败时仍完成恢复并返回 `cleanupWarning`。
+
+工作区文件、共享附件和备份不在清理范围内。文件被修改、替换、改成链接或权限不安全时会保留。临时产物**不包含在会话备份中，清理后无法通过恢复会话取回**。登记操作只支持单个 Host 进程写入同一存储。
+
+本插件的逐版变更见 [更新日志](./CHANGELOG.md)；截图生成方的接入与 DSH 核心逐版更新日志仍需核心源码工程，本插件没有代替它们。
 
 ## 快速开始
 
@@ -67,7 +79,7 @@ $DSH_HOME/backups/sessions/<sessionId>/<timestamp>-<title>/
 
 ## HTTP 路由
 
-五条路由都注册在 Host 连接的 `/api` 之下，由浏览器按文档相对路径访问（`.slice(1)`），并返回 JSON：
+七个路由路径都注册在 Host 连接的 `/api` 之下，由浏览器按文档相对路径访问（`.slice(1)`），并返回 JSON：
 
 | 方法 | 路径 | 请求体 | 响应 |
 | --- | --- | --- | --- |
@@ -76,6 +88,8 @@ $DSH_HOME/backups/sessions/<sessionId>/<timestamp>-<title>/
 | `POST` | `/api/session.backup.delete` | `{ sessionId, stopActivity? }` | `{ deleted }`；活动闸门拒绝时 409 + `details.activity`，未知 id 404，schedule 清理失败 500 `gateway/internal` |
 | `POST` | `/api/session.backup.restore` | `{ path }` | `{ restored }`，含 `attached`、`placement`、`workspaceId` / `reason`、`backupConsumed`、`pinned`（已置顶到分组最前，置顶被拒时为 `false`）；若会话已再次存在则返回 409（备份原样保留） |
 | `POST` | `/api/session.backup.remove` | `{ path }` | `{ removed }`；会顺带清理空的会话分组 |
+| `GET` / `POST` | `/api/session.backup.cleanup-settings` | 读取无请求体；保存为 `{ cleanupOnDelete: boolean }` | `{ settings: { cleanupOnDelete, editable, pending } }`；设置不可保存时返回 409 |
+| `POST` | `/api/session.backup.cleanup-retry` | `{}` | `{ results, settings }`；只重试已标记且会话已不存在的登记文件，开关关闭时返回 409 |
 
 `sessionId` 必须匹配普通的 id 模式，且每一条客户端提供的路径都会被校验必须严格位于其根目录之内，因此任何请求都无法触及备份库之外。标题来自 `sessionQuery` 服务（`readTitle`），读不到时回退为 `untitled`。在复制一个正在运行的会话之前，host 会通过 `sessions` 服务把内存中的日志落盘 —— 与 `dsh-session-log-export` 使用的是同一道屏障 —— 并在复制后重新校验每个文件的大小，因此仍在追加的日志会被重新复制，最终还会按 SHA-256 比较源与副本。若源持续变化、刷新或复制失败，请求报错且保留旧备份，不发布不完整副本。
 
@@ -126,7 +140,7 @@ node scripts/build-client.mjs   # 编辑 src/client.mjs 后重新生成 client.j
 npm test
 ```
 
-五个纯 Node 测试套件，跑在系统临时目录上，**不需要启动 harness、真实会话或网络**：
+九个纯 Node 测试套件，跑在系统临时目录上，**不需要启动 harness、真实会话或网络**：
 
 | 套件 | 覆盖 |
 | --- | --- |
@@ -135,6 +149,10 @@ npm test
 | `test/reuse-backup.mjs` | 内容指纹复用：不变内容不重复写入 |
 | `test/backup-delete-regression.mjs` | 「先备份再删除」只留一份：内容变化、并发、停止时收尾事件、备份失败中止删除 |
 | `test/client-delete-flow.mjs` | 浏览器侧真实 `createActions` 的请求序列：删除只调一次、恢复后刷新侧栏 |
+| `test/artifacts.mjs` | 登记持久化、修改和链接保留、跨实例并发登记与清理 |
+| `test/cleanup-routes.mjs` | 默认关闭、先备份后清理、失败重试、恢复保护与配置保存 |
+| `test/client-cleanup-flow.mjs` | 设置保存与失败状态、重试结果、备份旁入口及禁用条件 |
+| `test/cleanup-concurrency.mjs` | 恢复先于删除时重新核验日志、待清理标记损坏时仍完成恢复 |
 
 ## 安装
 

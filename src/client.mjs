@@ -54,6 +54,22 @@ const zh = {
   'footer.select': '多选',
   'footer.exit': '退出多选',
   'footer.backups': '备份',
+  'footer.cleanup': '临时文件',
+  'cleanup.title': '会话临时文件',
+  'cleanup.description': '删除会话时，可一并清理通过临时产物登记功能生成的截图和文件。工作区文件、共享附件和历史未登记文件会保留。临时文件不包含在会话备份中，清理后无法恢复。',
+  'cleanup.enabled': '删除会话时清理已登记临时文件',
+  'cleanup.loading': '正在读取设置…',
+  'cleanup.saving': '正在保存…',
+  'cleanup.default': '默认关闭，设置保存后对单个和批量删除均生效。',
+  'cleanup.readOnly': '当前配置无法在此保存，请在插件配置中设置 cleanupOnDelete。',
+  'cleanup.pending': '有 {count} 个会话的临时文件等待清理重试。',
+  'cleanup.retry': '重试待清理文件',
+  'cleanup.saved': '已保存',
+  'cleanup.done': '已清理 {count} 个临时文件。',
+  'cleanup.partial': '部分临时文件保留，可稍后重试：{message}',
+  'status.deletedCleanupPending': '会话已删除；部分临时文件保留，可在「临时文件」中查看并重试。',
+  'status.deletedOneCleaned': '已删除「{title}」，清理了 {count} 个临时文件',
+  'status.deletedManyCleaned': '已删除 {count} 个会话，清理了 {files} 个临时文件',
   'footer.count': '已选 {count} 个',
   'footer.backupSelected': '备份选中',
   'footer.deleteSelected': '删除选中',
@@ -63,7 +79,7 @@ const zh = {
   'menu.deselect': '移出选择',
   'menu.backup': '立即备份',
   'dialog.delete.title': '删除选中的会话？',
-  'dialog.delete.description': '将删除选中的 {count} 个会话，正在运行的会话会跳过。删除前会保存最新内容，更新已有备份而不新增副本；之后可在「备份」里恢复。',
+  'dialog.delete.description': '将删除选中的 {count} 个会话，正在运行的会话会跳过。删除前会保存最新内容，更新已有备份而不新增副本；之后可在「备份」里恢复。临时文件清理按「临时文件」设置执行。',
   'dialog.delete.confirm': '删除',
   'dialog.delete.cancel': '取消',
   'dialog.backups.title': '会话备份',
@@ -99,7 +115,7 @@ const zh = {
   'menu.deleteOne': '彻底删除…',
   'deleteOne.title': '彻底删除此会话？',
   'deleteOne.stopTitle': '停止并彻底删除此会话？',
-  'deleteOne.desc': '将删除“{title}”的会话日志与相关缓存数据。删除前会保存最新内容，更新已有备份而不新增副本；之后可在「备份」里恢复。工作区文件夹中的文件不受影响。',
+  'deleteOne.desc': '将删除“{title}”的会话日志与相关缓存数据。删除前会保存最新内容，更新已有备份而不新增副本；之后可在「备份」里恢复。临时文件清理按「临时文件」设置执行。工作区文件夹中的文件不受影响。',
   'deleteOne.activity': '删除前将停止的工作',
   'deleteOne.action': '删除',
   'deleteOne.stopAction': '停止并删除',
@@ -112,6 +128,22 @@ const en = {
   'footer.select': 'Select',
   'footer.exit': 'Exit select',
   'footer.backups': 'Backups',
+  'footer.cleanup': 'Temporary files',
+  'cleanup.title': 'Session temporary files',
+  'cleanup.description': 'When deleting a session, you can also clean up screenshots and files created through the temporary artifact registry. Workspace files, shared attachments, and older unregistered files are retained. Temporary files are not included in session backups and cannot be restored after cleanup.',
+  'cleanup.enabled': 'Clean up registered temporary files when deleting sessions',
+  'cleanup.loading': 'Loading settings…',
+  'cleanup.saving': 'Saving…',
+  'cleanup.default': 'Off by default. Saved settings apply to both individual and batch deletion.',
+  'cleanup.readOnly': 'This profile cannot save configuration here. Set cleanupOnDelete in the plugin configuration.',
+  'cleanup.pending': '{count} sessions have temporary files awaiting a cleanup retry.',
+  'cleanup.retry': 'Retry pending cleanup',
+  'cleanup.saved': 'Saved',
+  'cleanup.done': 'Cleaned up {count} temporary files.',
+  'cleanup.partial': 'Some temporary files were retained. You can retry later: {message}',
+  'status.deletedCleanupPending': 'Sessions deleted; some temporary files were retained. Review and retry under “Temporary files”.',
+  'status.deletedOneCleaned': 'Deleted “{title}” and cleaned up {count} temporary files',
+  'status.deletedManyCleaned': 'Deleted {count} sessions and cleaned up {files} temporary files',
   'footer.count': '{count} selected',
   'footer.backupSelected': 'Back up selected',
   'footer.deleteSelected': 'Delete selected',
@@ -121,7 +153,7 @@ const en = {
   'menu.deselect': 'Remove from selection',
   'menu.backup': 'Back up now',
   'dialog.delete.title': 'Delete the selected sessions?',
-  'dialog.delete.description': 'Delete the {count} selected sessions, skipping any still running. Their latest contents are saved first, updating existing backups without adding another copy. Restore them from “Backups”.',
+  'dialog.delete.description': 'Delete the {count} selected sessions, skipping any still running. Their latest contents are saved first, updating existing backups without adding another copy. Restore them from “Backups”. Temporary-file cleanup follows the “Temporary files” setting.',
   'dialog.delete.confirm': 'Delete',
   'dialog.delete.cancel': 'Cancel',
   'dialog.backups.title': 'Session backups',
@@ -157,7 +189,7 @@ const en = {
   'menu.deleteOne': 'Delete session…',
   'deleteOne.title': 'Permanently delete this session?',
   'deleteOne.stopTitle': 'Stop and delete this session?',
-  'deleteOne.desc': 'This deletes the session log and related cached data for “{title}” after saving the latest contents. An existing backup is updated without adding another copy; restore it from “Backups”. Files in the workspace folder are unaffected.',
+  'deleteOne.desc': 'This deletes the session log and related cached data for “{title}” after saving the latest contents. An existing backup is updated without adding another copy; restore it from “Backups”. Temporary-file cleanup follows the “Temporary files” setting. Files in the workspace folder are unaffected.',
   'deleteOne.activity': 'Work that will be stopped before deletion',
   'deleteOne.action': 'Delete',
   'deleteOne.stopAction': 'Stop and delete',
@@ -186,6 +218,8 @@ const CSS = `
 .dshsb-pending { font-size: 12px; opacity: .7; margin: 4px 0 0; }
 .dshsb-error { color: var(--dsw-alias-state-error-primary); font-size: 12px; margin: 4px 0 0; }
 .dshsb-activity { margin: 8px 0 0; padding-left: 18px; font-size: 12px; opacity: .85; }
+.dshsb-cleanup-setting { display: flex; align-items: flex-start; gap: 8px; }
+.dshsb-cleanup-setting input { flex: none; margin-top: 3px; accent-color: var(--dsw-alias-accent-primary); }
 `
 
 /**
@@ -225,6 +259,11 @@ function createStore() {
     error: null,
     backups: null,
     backupsLoading: false,
+    cleanupSettings: null,
+    cleanupLoading: false,
+    cleanupSaving: false,
+    cleanupError: null,
+    cleanupStatus: null,
   }
   const listeners = new Set()
   const set = (patch) => {
@@ -432,9 +471,13 @@ function createActions(ctx) {
     if (sessionIds.length === 0) return
     let deleted = 0
     let active = 0
+    let files = 0
+    let cleanupPending = false
     for (const sessionId of sessionIds) {
       try {
-        await deleteOne(sessionId)
+        const result = await deleteOne(sessionId)
+        files += result.cleanup?.removed ?? 0
+        cleanupPending ||= (result.cleanup?.failed?.length ?? 0) > 0
       } catch (error) {
         if (error?.cause?.code === 'workspace/session-active' || error?.code === 'workspace/session-active') {
           active += 1
@@ -448,13 +491,15 @@ function createActions(ctx) {
       deleted += 1
     }
     store.clearSelection()
-    if (active > 0) {
+    if (cleanupPending) {
+      store.setStatus({ key: 'status.deletedCleanupPending' })
+    } else if (active > 0) {
       store.setStatus({
         key: deleted > 0 ? 'status.deletedWithSkipped' : 'status.activeSkipped',
         params: { deleted, active, count: active },
       })
     } else {
-      store.setStatus({ key: 'status.deleted', params: { count: deleted } })
+      store.setStatus({ key: files > 0 ? 'status.deletedManyCleaned' : 'status.deleted', params: { count: deleted, files } })
     }
   }
 
@@ -510,7 +555,50 @@ function createActions(ctx) {
     }
   }
 
-  return { deleteOne, backupOne, backupMany, deleteMany, refreshBackups, restoreOne, removeOne }
+  const refreshCleanup = async () => {
+    store.set({ cleanupLoading: true, cleanupError: null, cleanupStatus: null })
+    try {
+      const payload = await call('cleanup-settings')
+      if (typeof payload?.settings?.cleanupOnDelete !== 'boolean') throw new Error('Invalid cleanup settings response')
+      store.set({ cleanupSettings: payload.settings, cleanupLoading: false })
+    } catch (error) {
+      store.set({ cleanupLoading: false, cleanupSettings: null, cleanupError: messageOf(error) })
+    }
+  }
+
+  const saveCleanup = async (enabled) => {
+    store.set({ cleanupSaving: true, cleanupError: null, cleanupStatus: null })
+    try {
+      const payload = await call('cleanup-settings', { cleanupOnDelete: enabled })
+      if (payload?.settings?.cleanupOnDelete !== enabled) throw new Error('Cleanup setting was not saved')
+      store.set({ cleanupSettings: payload.settings, cleanupSaving: false, cleanupStatus: { key: 'cleanup.saved' } })
+    } catch (error) {
+      // Preserve the previous acknowledged setting; a failed save must not show
+      // the proposed checkbox value as though the Host had accepted it.
+      store.set({ cleanupSaving: false, cleanupError: messageOf(error) })
+    }
+  }
+
+  const retryCleanup = async () => {
+    store.set({ cleanupSaving: true, cleanupError: null, cleanupStatus: null })
+    try {
+      const payload = await call('cleanup-retry', {})
+      if (!Array.isArray(payload?.results)) throw new Error('Invalid cleanup result')
+      const failures = payload.results.flatMap(result => result.failed ?? [])
+      const count = payload.results.reduce((sum, result) => sum + (result.removed ?? 0), 0)
+      store.set({
+        cleanupSettings: payload.settings,
+        cleanupSaving: false,
+        cleanupStatus: failures.length > 0
+          ? { key: 'cleanup.partial', params: { message: failures.map(failure => failure.reason).join('; ') } }
+          : { key: 'cleanup.done', params: { count } },
+      })
+    } catch (error) {
+      store.set({ cleanupSaving: false, cleanupError: messageOf(error) })
+    }
+  }
+
+  return { deleteOne, backupOne, backupMany, deleteMany, refreshBackups, restoreOne, removeOne, refreshCleanup, saveCleanup, retryCleanup }
 }
 
 // ---------------------------------------------------------------------------
@@ -615,6 +703,13 @@ function FooterActions({ wide, t, actions }) {
         },
       ),
     )
+    children.push(createElement(Button, {
+      key: 'cleanup',
+      size: 'sm',
+      variant: 'outline',
+      onClick: () => store.openDialog('cleanup'),
+      children: t('footer.cleanup'),
+    }))
   } else {
     children.push(createElement('span', { key: 'count', className: 'dshsb-count' }, t('footer.count', { count })))
     children.push(
@@ -786,6 +881,53 @@ function BackupsDialog({ open, t, actions }) {
   })
 }
 
+/** Host-backed policy. Permission to delete temporary files is user-only. */
+function CleanupDialog({ open, t, actions }) {
+  const state = useStore()
+  useEffect(() => {
+    if (open) void actions.refreshCleanup()
+  }, [open])
+  const settings = state.cleanupSettings
+  const pending = settings?.pending?.length ?? 0
+  return createElement(Modal, {
+    open,
+    onClose: () => { if (!state.cleanupSaving) store.closeDialog() },
+    title: t('cleanup.title'),
+    description: t('cleanup.description'),
+    closeLabel: t('dialog.close'),
+    children: createElement(Fragment, null,
+      state.cleanupLoading ? createElement('p', { role: 'status' }, t('cleanup.loading')) : null,
+      settings === null ? null : createElement(Fragment, null,
+        createElement('label', { className: 'dshsb-cleanup-setting' },
+          createElement('input', {
+            type: 'checkbox',
+            checked: settings.cleanupOnDelete === true,
+            disabled: !settings.editable || state.cleanupSaving || state.cleanupLoading,
+            onChange: event => void actions.saveCleanup(event.target.checked),
+          }),
+          t('cleanup.enabled'),
+        ),
+        createElement('p', null, t('cleanup.default')),
+        !settings.editable ? createElement('p', null, t('cleanup.readOnly')) : null,
+        pending > 0 ? createElement('p', null, t('cleanup.pending', { count: pending })) : null,
+        pending > 0 ? createElement(Button, {
+          disabled: state.cleanupSaving || state.cleanupLoading || !settings.cleanupOnDelete,
+          onClick: () => void actions.retryCleanup(),
+          children: t('cleanup.retry'),
+        }) : null,
+      ),
+      state.cleanupSaving ? createElement('p', { role: 'status' }, t('cleanup.saving')) : null,
+      state.cleanupStatus === null ? null : createElement('p', { role: 'status' }, t(state.cleanupStatus.key, state.cleanupStatus.params ?? {})),
+      state.cleanupError === null ? null : createElement('p', { role: 'alert', className: 'dshsb-error' }, state.cleanupError),
+    ),
+    footer: createElement(Button, {
+      disabled: state.cleanupSaving,
+      onClick: () => store.closeDialog(),
+      children: t('dialog.close'),
+    }),
+  })
+}
+
 /** The failure dialog for errors the status line alone would bury. */
 function ErrorDialog({ open, t }) {
   const state = useStore()
@@ -811,6 +953,7 @@ function BackupOverlay({ t, actions }) {
     createElement(DeleteOneDialog, { t, actions, open: state.dialog === 'deleteOne' }),
     createElement(ConfirmDeleteDialog, { t, actions, open: state.dialog === 'confirmDelete' }),
     createElement(BackupsDialog, { t, actions, open: state.dialog === 'backups' }),
+    createElement(CleanupDialog, { t, actions, open: state.dialog === 'cleanup' }),
     createElement(ErrorDialog, { t, open: state.error !== null }),
   )
 }
@@ -858,10 +1001,12 @@ function DeleteOneDialog({ open, t, actions }) {
     setError(null)
     actions
       .deleteOne(request.sessionId, busy ? { stopActivity: true } : undefined)
-      .then(() => {
+      .then((result) => {
         setDeleting(false)
         store.closeDeleteOne()
-        store.setStatus({ key: 'status.deletedOne', params: { title: request.displayTitle } })
+        const key = (result.cleanup?.failed?.length ?? 0) > 0 ? 'status.deletedCleanupPending'
+          : (result.cleanup?.removed ?? 0) > 0 ? 'status.deletedOneCleaned' : 'status.deletedOne'
+        store.setStatus({ key, params: { title: request.displayTitle, count: result.cleanup?.removed ?? 0 } })
         refreshList()
         leaveIfCurrent(request.sessionId)
       })

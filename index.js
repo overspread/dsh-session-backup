@@ -27,8 +27,29 @@ import { copyFile, cp, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, 
 import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { SessionArtifactStore } from './artifacts.js'
 
 export const name = 'session-backup'
+
+/** Validate the plugin's two settings without adding a runtime dependency. */
+export const Config = {
+  '~standard': {
+    version: 1,
+    vendor: 'dsh-session-backup',
+    validate(value = {}) {
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+        return { issues: [{ message: 'Session backup configuration must be an object' }] }
+      }
+      if (value.cleanupOnDelete !== undefined && typeof value.cleanupOnDelete !== 'boolean') {
+        return { issues: [{ message: 'cleanupOnDelete must be a boolean', path: ['cleanupOnDelete'] }] }
+      }
+      if (value.home !== undefined && (typeof value.home !== 'string' || value.home.trim() === '')) {
+        return { issues: [{ message: 'home must be a nonempty path', path: ['home'] }] }
+      }
+      return { value: { ...value, cleanupOnDelete: value.cleanupOnDelete ?? false } }
+    },
+  },
+}
 
 /**
  * Hard dependency: the connection service owns the Web fetch registry.
@@ -595,6 +616,16 @@ async function restoreBackupNow(path, options) {
     recursive: true,
     filter: (entry) => basename(entry) !== MANIFEST_FILE && !SKIP_NAMES.has(basename(entry)),
   })
+  // Restoration already copied the log; an unsafe/unreadable optional registry
+  // cannot turn it into a generic failure before attachment and pinning. Retry
+  // checks persisted Session absence, so the retained files stay protected.
+  let cleanupWarning
+  try {
+    await new SessionArtifactStore(home).cancelPending(sessionId)
+  } catch (error) {
+    cleanupWarning = String(error?.message ?? error)
+    options.logger?.warn?.(`session-backup: restored '${sessionId}' but its cleanup marker could not be reset: ${cleanupWarning}`)
+  }
   const attachment = await reattachRestoredSession(options.registry, sessionId)
   // Surface the restored Session ahead of every unpinned row: the registry's
   // pin is registry-global (covers the native Ungrouped bucket too) and its
@@ -628,6 +659,7 @@ async function restoreBackupNow(path, options) {
     restoredAt: new Date().toISOString(),
     backupConsumed,
     pinned,
+    ...(cleanupWarning === undefined ? {} : { cleanupWarning }),
     ...attachment,
   }
 }
@@ -984,7 +1016,11 @@ export async function deleteSessionCascade(ctx, sessionId, options = {}) {
   assertSessionId(sessionId)
   const existing = deleting.get(sessionId)
   if (existing !== undefined) return await existing
-  const operation = runDelete(ctx, sessionId, options.stopActivity === true, options.paths)
+  const paths = options.paths ?? deletePaths()
+  const group = resolve(paths.backupRoot ?? backupRoot(paths.home ?? dshHome()), sessionId)
+  // Restore, deletion (including orphaned logs), and artifact cleanup share the
+  // same group lock. Re-evaluate session existence only after obtaining it.
+  const operation = withBackupGroup(group, () => runDelete(ctx, sessionId, options.stopActivity === true, paths, options.cleanupOnDelete === true))
   deleting.set(sessionId, operation)
   try {
     return await operation
@@ -1019,15 +1055,22 @@ async function hasResidual(ctx, sessionId, paths) {
   return false
 }
 
-async function runDelete(ctx, sessionId, stopActivity, explicitPaths) {
+async function runDelete(ctx, sessionId, stopActivity, explicitPaths, cleanupOnDelete) {
   const paths = explicitPaths ?? deletePaths()
+  const artifacts = new SessionArtifactStore(paths.home ?? dshHome())
   const persistence = ctx.get('sessionPersistence')
+  const finish = async (result) => {
+    removed.add(sessionId)
+    emitRemoved(ctx, sessionId)
+    if (!cleanupOnDelete) return result
+    return { ...result, cleanup: await cleanupDeletedArtifacts(ctx, sessionId, paths, artifacts) }
+  }
   // Idempotent repeat: this process already destroyed the id.
   if (removed.has(sessionId)) {
     const still = persistence !== undefined && persistence !== null && typeof persistence.stat === 'function'
-      ? await persistence.stat(sessionId).catch(() => undefined)
+      ? await persistence.stat(sessionId)
       : undefined
-    if (still === undefined || still === null) return { deleted: true }
+    if (still === undefined || still === null) return await finish({ deleted: true })
   }
   // A missing log is either a genuinely unknown id (refuse) or a half-deleted
   // residue whose row the Sidebar still shows (finish the cleanup below).
@@ -1035,7 +1078,7 @@ async function runDelete(ctx, sessionId, stopActivity, explicitPaths) {
   if (persistence !== undefined && persistence !== null && typeof persistence.stat === 'function') {
     const snapshot = await persistence.stat(sessionId).catch(() => undefined)
     if (snapshot === undefined || snapshot === null) {
-      if (!(await hasResidual(ctx, sessionId, paths))) throw notFoundError(sessionId)
+      if (!(await hasResidual(ctx, sessionId, paths)) && !(await artifacts.has(sessionId))) throw notFoundError(sessionId)
       orphaned = true
     }
   }
@@ -1091,37 +1134,81 @@ async function runDelete(ctx, sessionId, stopActivity, explicitPaths) {
     // No log left: the activity gate above already stopped work and detached
     // the live entry, and the cache cascade just ran. The only work left is the
     // event the Sidebar waits on, so a half-deleted id disappears.
-    removed.add(sessionId)
-    emitRemoved(ctx, sessionId)
-    return { deleted: true, alreadyGone: true }
+    if (cleanupOnDelete) await artifacts.markPending(sessionId)
+    return await finish({ deleted: true, alreadyGone: true })
   }
   const backups = paths.backupRoot ?? backupRoot(paths.home ?? dshHome())
-  await withBackupGroup(resolve(backups, sessionId), async () => {
-    let lease = await acquireDeletionLease(ctx, sessionId)
-    try {
-      // Stop/detach may append closing events; capture them while no writer can
-      // re-enter. The same group lock prevents restore/remove consuming this copy.
-      if (await locateSessionDir(sessionId, paths.sessionsRoot) !== undefined) {
-        try {
-          await createBackupNow(ctx, sessionId, { ...paths, backupRoot: backups, beforeDelete: true })
-        } catch (error) {
-          throw internalError(sessionId, 'its final backup could not be saved; the session was not deleted', error)
-        }
+  let lease = await acquireDeletionLease(ctx, sessionId)
+  try {
+    // Stop/detach may append closing events; capture them while no writer can
+    // re-enter. The outer group lock keeps restore/remove off this copy.
+    if (await locateSessionDir(sessionId, paths.sessionsRoot) !== undefined) {
+      try {
+        await createBackupNow(ctx, sessionId, { ...paths, backupRoot: backups, beforeDelete: true })
+      } catch (error) {
+        throw internalError(sessionId, 'its final backup could not be saved; the session was not deleted', error)
       }
-      // Older native remove APIs acquire their own deletion lock, so hand the
-      // write lease back immediately before entering that atomic native path.
-      if (typeof persistence?.remove === 'function' && typeof lease?.close === 'function') {
-        await lease.close()
-        lease = undefined
-      }
-      await removeStored(ctx, sessionId, paths)
-    } finally {
-      if (typeof lease?.close === 'function') await lease.close()
     }
-  })
-  removed.add(sessionId)
-  emitRemoved(ctx, sessionId)
-  return { deleted: true }
+    // Older native remove APIs acquire their own deletion lock, so hand the
+    // write lease back immediately before entering that atomic native path.
+    if (typeof persistence?.remove === 'function' && typeof lease?.close === 'function') {
+      await lease.close()
+      lease = undefined
+    }
+    // Keep deletion intent outside the log, so an interrupted cleanup remains
+    // reviewable and retryable after the Session directory has disappeared.
+    if (cleanupOnDelete) await artifacts.markPending(sessionId)
+    try {
+      await removeStored(ctx, sessionId, paths)
+    } catch (error) {
+      // A refused log deletion leaves a live Session; release its pending flag
+      // only when the log is positively present. Unknown state stays pending.
+      if (cleanupOnDelete && await persistence?.stat?.(sessionId).catch(() => undefined) != null) {
+        await artifacts.cancelPending(sessionId).catch(cause => ctx.logger?.warn?.(String(cause)))
+      }
+      throw error
+    }
+  } finally {
+    if (typeof lease?.close === 'function') await lease.close()
+  }
+  return await finish({ deleted: true })
+}
+
+/** Only a proven-absent Session may lose its registered temporary files. */
+async function assertDeletedSession(ctx, sessionId, paths) {
+  const persistence = ctx.get('sessionPersistence')
+  if (typeof persistence?.stat !== 'function') throw conflict('Session absence cannot be verified in this profile')
+  if (await persistence.stat(sessionId) != null || ctx.get('sessions')?.get?.(sessionId) != null
+      || await locateSessionDir(sessionId, paths.sessionsRoot) !== undefined) {
+    throw conflict('The session still exists; its temporary files were retained')
+  }
+}
+
+/** A cleanup failure never disguises an already completed log deletion. */
+async function cleanupDeletedArtifacts(ctx, sessionId, paths, artifacts) {
+  try {
+    await assertDeletedSession(ctx, sessionId, paths)
+    return await artifacts.cleanup(sessionId)
+  } catch (error) {
+    ctx.logger?.warn?.(`session-backup: temporary files for '${sessionId}' were retained: ${String(error)}`)
+    return { removed: 0, bytes: 0, retained: null, failed: [{ id: sessionId, reason: String(error?.message ?? error) }] }
+  }
+}
+
+/** Retry only marked inventories, serializing with backup restoration. */
+export async function retryArtifactCleanup(ctx, paths) {
+  const artifacts = new SessionArtifactStore(paths.home ?? dshHome())
+  const results = []
+  for (const { sessionId } of await artifacts.pending()) {
+    if (deleting.has(sessionId)) continue
+    const group = resolve(paths.backupRoot ?? backupRoot(paths.home ?? dshHome()), sessionId)
+    results.push(await withBackupGroup(group, async () => {
+      // Restoration may have cancelled this marker while we waited for its lock.
+      if (!(await artifacts.pending()).some(entry => entry.sessionId === sessionId)) return { sessionId, skipped: true }
+      return { sessionId, ...await cleanupDeletedArtifacts(ctx, sessionId, paths, artifacts) }
+    }))
+  }
+  return results
 }
 
 /**
@@ -1188,7 +1275,10 @@ function route(ctx, handler) {
  * @param ctx - Host context carrying the connection service.
  * @param config - `{ home }` override; defaults to `$DSH_HOME`.
  */
-export function apply(ctx, config = {}) {
+export function apply(ctx, rawConfig = {}) {
+  const validation = Config['~standard'].validate(rawConfig)
+  if (validation.issues) throw badRequest(validation.issues[0].message)
+  const config = validation.value
   const home = config.home ?? dshHome()
   const paths = {
     home,
@@ -1196,9 +1286,56 @@ export function apply(ctx, config = {}) {
     backupRoot: backupRoot(home),
     storagesRoot: join(home, 'storages'),
   }
+  const artifacts = new SessionArtifactStore(home)
+  // Producers opt into ownership by allocating files through this service. It
+  // accepts bytes, never a path to an existing file; cleanup stays Host-owned.
+  if (typeof ctx.provide === 'function') ctx.provide('sessionArtifacts', {
+    save: async (sessionId, filename, data) => {
+      assertSessionId(sessionId)
+      if (deleting.has(sessionId)) throw conflict('The session is being deleted')
+      return withBackupGroup(resolve(paths.backupRoot, sessionId), async () => {
+        if (deleting.has(sessionId)) throw conflict('The session is being deleted')
+        const persistence = ctx.get('sessionPersistence')
+        if (typeof persistence?.stat !== 'function' || await persistence.stat(sessionId) == null) {
+          throw notFoundError(sessionId)
+        }
+        return artifacts.save(sessionId, filename, data)
+      })
+    },
+  })
+  const settings = async () => ({
+    cleanupOnDelete: config.cleanupOnDelete,
+    editable: ctx.fiber?.entry !== undefined && typeof ctx.get('configEditor')?.edit === 'function',
+    pending: await artifacts.pending(),
+  })
   const fetch = connectionOf(ctx).fetch
   ctx.effect(() => {
     const registered = [
+      fetch.register({
+        path: `${API_PATH}.cleanup-settings`,
+        methods: ['GET', 'POST'],
+        requestBody: 'buffered',
+        fetch: route(ctx, async (request, body) => {
+          if (request.method === 'GET') return { settings: await settings() }
+          if (typeof body?.cleanupOnDelete !== 'boolean') throw badRequest('cleanupOnDelete must be a boolean')
+          const editor = ctx.get('configEditor')
+          const entry = ctx.fiber?.entry
+          if (entry === undefined || typeof editor?.edit !== 'function') {
+            throw conflict('Configuration cannot be saved in this profile')
+          }
+          await editor.edit(entry, current => ({ ...current, cleanupOnDelete: body.cleanupOnDelete }))
+          return { settings: { ...await settings(), cleanupOnDelete: body.cleanupOnDelete } }
+        }),
+      }),
+      fetch.register({
+        path: `${API_PATH}.cleanup-retry`,
+        methods: ['POST'],
+        requestBody: 'buffered',
+        fetch: route(ctx, async () => {
+          if (!config.cleanupOnDelete) throw conflict('Temporary-file cleanup is turned off')
+          return { results: await retryArtifactCleanup(ctx, paths), settings: await settings() }
+        }),
+      }),
       fetch.register({
         path: `${API_PATH}.list`,
         methods: ['GET'],
@@ -1242,6 +1379,7 @@ export function apply(ctx, config = {}) {
         fetch: route(ctx, async (request, body) => ({
           deleted: await deleteSessionCascade(ctx, assertSessionId(body?.sessionId), {
             stopActivity: body?.stopActivity === true,
+            cleanupOnDelete: config.cleanupOnDelete,
             paths,
           }),
         })),

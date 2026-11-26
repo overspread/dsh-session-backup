@@ -184,13 +184,15 @@ async function runMode(kind) {
 
   apply(ctx, { home: home.home })
   assert.deepEqual([...calls.routes.keys()].sort(), [
+    '/api/session.backup.cleanup-retry',
+    '/api/session.backup.cleanup-settings',
     '/api/session.backup.create',
     '/api/session.backup.delete',
     '/api/session.backup.list',
     '/api/session.backup.remove',
     '/api/session.backup.restore',
   ])
-  ok(`[${kind}] 5 routes registered`)
+  ok(`[${kind}] 7 routes registered`)
 
   // 1. idle delete succeeds, full cascade, emit last-ish
   let res = await post(calls.routes, '/api/session.backup.delete', { sessionId: SESSION })
