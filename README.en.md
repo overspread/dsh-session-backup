@@ -18,19 +18,34 @@ Blank placeholder rows (the provisional 新建会话 / New session row) and arch
 
 ## What the backup guarantees
 
-- **Back up before deleting** — single and batch deletion both save the **final backup** through the Host after stopping work and checking the writer, then remove the log, so a batch never removes a session that was not saved first. A failed backup preserves the old copy and the live log and refuses the delete with the reason; only “nothing to copy” and “no Host face mounted” proceed.
+- **Back up before deleting** — single and batch deletion attempt a preflight backup, then verify and save the **final backup** after stopping work and acquiring the write lease. Preflight path and I/O errors do not stop activity, purge reminders, or remove workspace membership. Only a consistency failure caused by a changing source may proceed with an explicitly authorized stop, followed by a strict final backup. A final-backup failure preserves the existing backup and live log. Residual-only cleanup requires both persistence and directory checks to confirm that the log is absent.
 - **One copy per content** — a per-file `relative path:sha256` fingerprint decides: an exact match **reuses** the existing backup (`reused: true`) with no new directory; changed content **refreshes the latest backup at the same path** (`updated: true`), so “back up manually, then delete” always leaves exactly one entry. The new copy is fully written and verified before replacing the old one; failures keep the old backup and abort the delete. A repeated backup request refreshes the same way, and existing historical backups are never pruned in bulk.
 - **Concurrency-safe** — backup / restore / remove-backup requests for one session run serialized, so clicking a manual backup and a delete together never writes two copies.
 
-## Optional session temporary-file cleanup
+## Optional session file cleanup
 
-Open **Temporary files** beside **Backups** in the sidebar footer to enable cleanup of registered temporary files on session deletion. It is **off by default**. The plugin saves `cleanupOnDelete` through its configuration editor for both individual and batch deletion; an unavailable or rejected save is reported.
+Open **File cleanup** beside **Backups** in the sidebar footer for two independent settings. **Both default to off** and apply to individual and batch deletion:
+
+- `cleanupOnDelete`: clean registered temporary files when deleting a session.
+- `cleanupAttachmentsOnDelete`: after deleting a session or backup, reclaim uploaded image and file copies no longer referenced by any session or retained backup.
+
+Each setting is saved separately. Existing temporary-file permission never enables upload collection automatically. An unavailable or rejected configuration save is reported.
+
+### Registered temporary files
 
 Only files allocated by a producer through `ctx.get('sessionArtifacts').save(sessionId, filename, bytes)` are eligible. Objects live under `$DSH_HOME/session-artifacts/objects/<sessionId>/`, with separate ownership ledgers in `session-artifacts/registry/`. The API accepts content bytes, never an existing file path. **Existing screenshots, arbitrary shell outputs, and older unregistered session files are not imported automatically**; producers must adopt the API.
 
-After the final backup succeeds, deletion records cleanup intent and removes artifacts only after confirming the session log is gone. Failed inventories survive restarts and can be retried under **Temporary files → Retry pending cleanup** after verifying session absence again. Restoring a session cancels its pending marker; a reset failure returns `cleanupWarning` while completing restoration.
+After the final backup succeeds, deletion records cleanup intent and removes artifacts only after confirming the session log is gone. Failed inventories survive restarts and can be retried under **File cleanup → Retry pending cleanup** after verifying session absence again. Individual corrupt ledgers are retained and reported without blocking healthy inventories or retries. Restoring a session cancels its temporary-file pending marker; a reset failure completes restoration and displays `cleanupWarning`. A subsequent list-refresh failure also preserves the successful restore result.
 
-Workspace files, shared attachments, and backups are excluded. Modified or replaced files, links, and unsafe permissions cause retention. Temporary artifacts **are not included in session backups and cannot be recovered by restoring a session after cleanup**. Only one Host process may write the registry.
+Workspace files, uploads, and backups are outside this setting's scope. Modified or replaced files, links, and unsafe permissions cause retention. Temporary artifacts **are not included in session backups and cannot be recovered by restoring a session after cleanup**. Only one Host process may write the registry.
+
+### Uploaded image and file copies
+
+Uploaded copies are independent of the user's originals. Candidates come only from the logs of a session or backup explicitly being deleted; inventories live in `$DSH_HOME/attachment-cleanup/registry/`. There is no historical orphan sweep. Reference scans cover all physical log generations (including zstd), history, forks, pre-compaction records, and all retained backups. Incomplete reads or changing references retain candidates and report the reason.
+
+**Deleting a session normally retains its uploads**, because its automatic final backup still references them. Removing the last referencing backup permits collection; other sessions and restored sessions continue to protect their uploads. Generic file objects and their internal named hard links are verified and reclaimed together. Changed contents, replaced files, symlinks, or extra hard links cause retention. Originals, workspace files, derived request-image caches, and temporary upload files are never deleted. The UI reports reclaimed counts and bytes separately from retention, deferral, and failures; candidates survive restarts and can be retried.
+
+Safe collection requires a single standard Web Host, matching local attachment and session stores, and a use observer installed before the Web listener starts. A first hot activation retains uploads until a Host restart. Uploads admitted, read, or resolved to host paths during the current backend lifetime remain protected until that backend exits, preventing collection of uploads not yet committed to a session. SDK/ACP, custom startup writers, and shared storage with multiple Hosts are unsupported; leave this option off in those deployments.
 
 See the [changelog](./CHANGELOG.md) for plugin releases. Screenshot producer integration and DSH core per-version release notes still require the core source project and are not supplied by this plugin.
 
@@ -52,7 +67,7 @@ $DSH_HOME/backups/sessions/<sessionId>/<timestamp>-<title>/
 
 The directory name is the local timestamp (`20261017-184533`) followed by the session's **current title**, sanitized for the filesystem (`/ \ : * ? " < > |` and control characters become spaces, capped at 48 characters, `untitled` when nothing usable remains). Two backups inside the same second get `-1`, `-2` … suffixes. `session.lock` and `.DS_Store` never enter a backup; the manifest's `backup.json` never leaves one on restore.
 
-Attachments are content-addressed and survive session deletion, so the session directory alone is a complete, restorable copy.
+Backups copy session logs; attachments remain in the content-addressed store under the same `$DSH_HOME` and are not embedded in the backup directory. With upload collection disabled they retain existing storage behavior; with it enabled, retained backup references also protect them. A backup directory is not a standalone migration archive without the original attachment store.
 
 ## How the delete engine works
 
@@ -61,18 +76,18 @@ The whole deletion path lives inside this plugin and goes through no kernel meth
 1. **Menu row** — registered on the official `sidebar.workspaces.session.menu.item` slot with a **double registration** so exactly one delete row ever renders on any kernel: `id: 'delete'` at `priority: -1` registers a component that renders `null`, shadowing the local alpha.3 kernel's built-in row regardless of registration order; `id: 'session-delete'`, `order: 460` registers this plugin's real row (right after 归档 / Archive). Upstream rc.2 has no kernel row, so the shadow is inert and the menu order matches alpha.3 exactly.
 2. **Confirm dialog** — injected into `shell.overlay`, opening the danger confirm up front (copy matches the kernel verbatim: permanent deletion of the log and caches, workspace files unaffected).
 3. **Activity gate (409 upgrade)** — the host asks the `workspace/session-activity` waterfall (the same providers the kernel's archive gate uses). When work is active it answers `409 workspace/session-active` carrying the activity list — the client upgrades **the same dialog in place** to “停止并彻底删除此会话？ (Stop and delete this session?)” with the activity list and a “停止并删除 (Stop and delete)” button, matching the kernel's busy-upgrade behaviour byte for byte.
-4. **Stop path** — with `stopActivity: true` it first fires `workspace/session-stop` (stopping agent/jobs/subagent turns *and* purging every schedule row for the session), then quiesces the bare agent and detaches the entered store entry (firing `session/disposed`, which closes the write handle — rc.2 exposes no by-id `dispose()` capability, and this detach seam works on both versions), polls the gate until it answers empty, and only then probes the write lease. **A failed schedule-row purge aborts the whole deletion** (`gateway/internal`): a surviving armed row would cold-resume the log this cascade is destroying.
-5. **Cascade** — once the write lease is exclusive (and held across the whole filesystem-delete path on the current rc.3 build): save the final backup, then **clear spill / projection cache / workspace accounting first** (each seam feature-detected per version), then **last** remove the log directory (alpha.3 through the kernel's `remove()`; rc.2 has no `remove`, so the directory is located and `rm`'d with a post-verify), then `ctx.emit('api-session/removed')` so the sidebar row disappears. Cache cleanup is **not** best-effort: any genuine failure aborts the delete and keeps the log, so “log gone, cache behind” residue cannot be produced. Attachments are shared content-addressed blobs and are **never deleted** (spec A5); workspace folders and user files are untouched.
-6. **Backup first** — `/api/session.backup.delete` saves the final backup by that order before the log is removed; see [What the backup guarantees](#what-the-backup-guarantees) for the semantics — a failed backup preserves the old copy and the live log and refuses the delete, and closing events produced while stopping land in that one copy.
+4. **Preflight and stop** — read persistence and inspect the directory first; storage errors refuse deletion. Save a preflight backup before invoking `workspace/session-stop` for `stopActivity: true`. That event stops agent/jobs/subagent work and the Host schedule provider also removes active reminders. Quiesce and detach the live entry, then wait for activity to settle. Idle deletion does not invoke the stop event. Stopping cannot be rolled back: if the final backup fails afterward, the log and existing backup remain, but stopped activity and removed reminders are not restored.
+5. **Cascade** — acquire the exclusive write lease → save the final backup including closing events → optionally persist cleanup intent → purge schedule rows (failure aborts) → remove and verify the log → best-effort spill / projection / workspace cleanup → emit `api-session/removed`. Keep the lease across filesystem deletion; release it before a native `remove()` that owns its own lease. Post-deletion cache failures are returned in `deleted.warnings` and retried by repeating deletion, without misreporting a completed log deletion as a failure. The independent upload setting may reclaim unreferenced candidates; retained backups still protect uploads, and workspace directories and user originals remain untouched.
+6. **Backup first** — preflight and final backups share content fingerprints and the existing path, reusing unchanged content without duplicate copies. Failures never publish an incomplete replacement. Symlinks in source entries, restore targets, and store directories are refused so they cannot redirect copying or manifest writes.
 
-Concurrent deletes of the same id share the first request's outcome (idempotent): a repeat answers success without re-running the cascade.
+Concurrent deletes of the same id share the first request's outcome. Repeated deletion answers success and retries cache cleanup, plus pending artifact cleanup when enabled.
 
 Semantics of a failed backup:
 
 | failure | result |
 | --- | --- |
 | backup route answers a real error (disk full, conflict, …) | delete **refused**, error dialog shown |
-| a cache-cleanup step fails | delete aborts (500); the log **stays** so it can be retried, and no half-deleted residue is left |
+| post-deletion cache cleanup fails | deletion succeeds with `deleted.warnings`; the final backup remains, and repeated deletion retries cache cleanup |
 | session has no directory left to back up | nothing to copy; a missing Session still returns 404 as before |
 | activity gate refusal (session is running) | 409 upgrades to the “Stop and delete” dialog for a second confirmation |
 | schedule-row purge fails | delete aborts (`gateway/internal`) so a timer cannot resurrect the log |
@@ -87,9 +102,9 @@ All seven route paths are registered on the Host connection below `/api`, addres
 | `POST` | `/api/session.backup.create` | `{ sessionId, beforeDelete? }` | `{ backup }` with `path`, `title`, `dirName`, `bytes`, `consistent`, `reused` (identical contents), `updated` (existing directory refreshed); refreshing the latest backup is the default, with explicit `beforeDelete: false` preserving an independent historical snapshot |
 | `POST` | `/api/session.backup.delete` | `{ sessionId, stopActivity? }` | `{ deleted }`; 409 + `details.activity` on an active refusal, 404 for an unknown id, 500 `gateway/internal` when the schedule purge fails |
 | `POST` | `/api/session.backup.restore` | `{ path }` | `{ restored }` with `attached`, `placement`, `workspaceId` / `reason`, `backupConsumed`, `pinned` (`true` when pinned to the front of its group, `false` when the pin was refused); 409 if the session exists again (the backup is kept) |
-| `POST` | `/api/session.backup.remove` | `{ path }` | `{ removed }`; prunes an empty session group |
-| `GET` / `POST` | `/api/session.backup.cleanup-settings` | none for GET; `{ cleanupOnDelete: boolean }` to save | `{ settings: { cleanupOnDelete, editable, pending } }`; 409 when configuration cannot be saved |
-| `POST` | `/api/session.backup.cleanup-retry` | `{}` | `{ results, settings }`; retries only marked inventories with verified session absence, 409 while cleanup is disabled |
+| `POST` | `/api/session.backup.remove` | `{ path }` | `{ removed }`; prunes an empty session group; includes `removed.attachments` when upload collection is enabled |
+| `GET` / `POST` | `/api/session.backup.cleanup-settings` | none for GET; `{ cleanupOnDelete?: boolean, cleanupAttachmentsOnDelete?: boolean }`, at least one, to save | `{ settings: { cleanupOnDelete, cleanupAttachmentsOnDelete, editable, pending, attachmentPending, pendingErrors?, attachmentPendingErrors? } }`; reports corrupt inventories separately; 409 when configuration cannot be saved |
+| `POST` | `/api/session.backup.cleanup-retry` | `{}` | `{ results, settings }`; retries enabled categories only; 409 when both are off. Temporary files require verified session absence; uploads require a full reference check |
 
 `sessionId` must match a plain id pattern and every client-supplied path is checked to be strictly inside its root, so no request can reach outside the store. The title comes from the `sessionQuery` service (`readTitle`), falling back to `untitled` when it cannot be read. Before copying a live session the host flushes its in-memory log through the `sessions` service — the same barrier `dsh-session-log-export` uses — and each file's size is re-verified after the copy, so a log still being appended is re-copied and finally source and copy are compared using SHA-256. A changing source, flush failure, or copy failure rejects the request, preserves the old backup, and never publishes a partial copy.
 
@@ -140,7 +155,7 @@ The build rewrites each ESM import into a `require()` of the same specifier (`re
 npm test
 ```
 
-Nine plain-Node suites running against system temp directories — **no harness, no real session, no network**:
+Eleven plain-Node suites running against system temp directories — **no harness, no real session, no network**:
 
 | suite | covers |
 | --- | --- |
@@ -151,7 +166,9 @@ Nine plain-Node suites running against system temp directories — **no harness,
 | `test/client-delete-flow.mjs` | the browser-side request sequences of the real `createActions`: one delete call, sidebar refresh after restore |
 | `test/artifacts.mjs` | durable ownership, retention of modified files and links, concurrent saves and cleanup across instances |
 | `test/cleanup-routes.mjs` | default-off policy, backup before cleanup, failed cleanup retries, restore protection, configuration saves |
-| `test/client-cleanup-flow.mjs` | settings persistence and failures, retry results, adjacent footer entry and disabled controls |
+| `test/attachments.mjs` | upload references, compressed logs, object and alias families, fail-closed scans, use observer, durable candidates |
+| `test/attachment-routes.mjs` | independent settings, final-backup reference retention, last-backup collection, restore and retry protection |
+| `test/client-cleanup-flow.mjs` | independent settings saves, failure states, upload collection statistics, adjacent footer entry and disabled controls |
 | `test/cleanup-concurrency.mjs` | log state rechecked after a queued restore, successful restoration despite a corrupt cleanup marker |
 
 ## Install

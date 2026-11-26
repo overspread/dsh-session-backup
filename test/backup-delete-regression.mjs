@@ -1,6 +1,6 @@
 /** Regression scenarios for manual backup followed by deletion, using real files and registered HTTP handlers. */
 import assert from 'node:assert/strict'
-import { appendFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat as fsstat, writeFile } from 'node:fs/promises'
+import { appendFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat as fsstat, symlink, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -256,21 +256,210 @@ test('an id with no log and no residue is still refused as not found', () => fix
   assert.equal(data.error.code, 'session/not-found')
 }))
 
-// The failure that stranded this session in the first place: cache cleanup was
-// best-effort AND ran after the log was already gone, so one failed step left a
-// Sidebar row no delete could ever reach. Cleanup now runs first and aborts.
-test('a failing cache step aborts the delete and leaves the log retryable', () => fixture(async f => {
+// A deleted log stays deleted even if a derived cache is unavailable. The
+// response reports the warning, and idempotent retry revisits failed cleanup.
+test('cache failure reports a completed deletion with a warning and remains retryable', () => fixture(async f => {
   const persistence = f.ctx.get('sessionPersistence')
+  let unavailable = true
+  let invalidations = 0
   f.ctx.get = (name) => name === 'sessionPersistence'
     ? persistence
     : name === 'sessionProjectionCache'
-      ? { invalidate: async () => { throw new Error('projection cache unavailable') } }
+      ? { invalidate: async () => { invalidations += 1; if (unavailable) throw new Error('projection cache unavailable') } }
       : undefined
-  const { status, data } = await f.postRaw('delete', { sessionId: f.id })
-  assert.equal(status, 500, 'a real cleanup failure refuses the delete')
-  assert.match(data.error.message, /could not be cleared/)
-  assert.equal(await exists(f.log), true, 'nothing is half-deleted: the log survives for a retry')
+  const first = await f.post('delete', { sessionId: f.id })
+  assert.deepEqual(first.deleted.warnings, ['projection checkpoint'])
+  assert.equal(await exists(f.log), false)
+  unavailable = false
+  const retried = await f.post('delete', { sessionId: f.id })
+  assert.equal(retried.deleted.warnings, undefined)
+  assert.equal(invalidations, 2)
+  assert.equal((await f.backups()).length, 1)
 }))
+
+for (const stopActivity of [false, true]) {
+  test(`backup preflight failure preserves reminders and workspace membership (stopActivity=${stopActivity})`, () => fixture(async f => {
+    const seen = []
+    const baseGet = f.ctx.get
+    f.ctx.get = name => name === 'schedule'
+      ? { deleteSessionTasks: async () => seen.push('schedule') }
+      : name === 'workspaceRegistry'
+        ? { unaccountSession: async () => seen.push('workspace') }
+        : baseGet(name)
+    f.ctx.parallel = async () => seen.push('stop')
+    f.ctx.emit = () => seen.push('removed')
+    const staging = join(backupRoot(f.home), '.pending')
+    await mkdir(backupRoot(f.home), { recursive: true })
+    await writeFile(staging, 'cannot allocate staging')
+    const result = await f.postRaw('delete', { sessionId: f.id, stopActivity })
+    assert.equal(result.status, 500)
+    assert.match(result.data.error.message, /final backup could not be saved/)
+    assert.deepEqual(seen, [], 'no stop, schedule purge, workspace mutation or removal event before backup')
+    assert.equal(await readFile(f.log, 'utf8'), 'original\n')
+  }))
+}
+
+test('an initial persistence read error aborts without falsely deleting or unaccounting a live session', () => fixture(async f => {
+  const baseGet = f.ctx.get
+  const persistence = baseGet('sessionPersistence')
+  const seen = []
+  persistence.stat = async () => { throw Object.assign(new Error('fixture EIO'), { code: 'EIO' }) }
+  persistence.remove = async () => seen.push('remove')
+  f.ctx.get = name => name === 'sessionPersistence' ? persistence
+    : name === 'workspaceRegistry' ? { list: () => [{ sessionIds: [f.id] }], unaccountSession: async () => seen.push('workspace') }
+      : name === 'schedule' ? { deleteSessionTasks: async () => seen.push('schedule') } : baseGet(name)
+  f.ctx.parallel = async () => seen.push('stop')
+  f.ctx.emit = () => seen.push('removed')
+  const result = await f.postRaw('delete', { sessionId: f.id })
+  assert.equal(result.status, 500)
+  assert.match(result.data.error.message, /stored state could not be read/)
+  assert.deepEqual(seen, [])
+  assert.equal(await readFile(f.log, 'utf8'), 'original\n')
+}))
+
+test('an absent persistence snapshot with an existing directory is never mistaken for an orphan', () => fixture(async f => {
+  const baseGet = f.ctx.get
+  const persistence = baseGet('sessionPersistence')
+  const stat = persistence.stat
+  let reads = 0
+  persistence.stat = async () => ++reads === 1 ? undefined : stat()
+  let removed = false
+  const remove = persistence.remove
+  persistence.remove = async () => { removed = true; await remove() }
+  f.ctx.get = name => name === 'sessionPersistence' ? persistence : baseGet(name)
+  const result = await f.post('delete', { sessionId: f.id })
+  assert.equal(result.deleted.alreadyGone, undefined)
+  assert.equal(removed, true)
+  assert.equal(await exists(f.log), false)
+  assert.equal((await f.backups()).length, 1)
+}))
+
+test('a session-directory symlink is refused without overwriting its target manifest', () => fixture(async f => {
+  const target = join(f.home, 'linked-session-target')
+  assert.ok(f.dir.startsWith(`${f.home}/sessions/`))
+  await rename(f.dir, target)
+  await writeFile(join(target, 'backup.json'), 'target manifest must survive')
+  await symlink(target, f.dir)
+  await assert.rejects(createBackup(f.ctx, f.id, f.options), { code: 'session-backup/unsafe-path' })
+  assert.equal(await readFile(join(target, 'backup.json'), 'utf8'), 'target manifest must survive')
+  assert.equal((await f.backups()).length, 0)
+}))
+
+for (const name of ['backup.json', 'nested-link']) {
+  test(`a linked source entry (${name}) is rejected before publishing a backup`, () => fixture(async f => {
+    const outside = join(f.home, 'outside.txt')
+    await writeFile(outside, 'outside content')
+    await symlink(outside, join(f.dir, name))
+    await assert.rejects(createBackup(f.ctx, f.id, f.options), { code: 'session-backup/unsafe-path' })
+    assert.equal(await readFile(outside, 'utf8'), 'outside content')
+    assert.equal((await f.backups()).length, 0)
+  }))
+}
+
+for (const kind of ['backups', 'staging']) {
+  test(`a linked ${kind} store cannot redirect backup writes`, () => fixture(async f => {
+    const outside = join(f.home, 'outside-store')
+    await mkdir(outside)
+    await writeFile(join(outside, 'sentinel'), 'unchanged')
+    const link = kind === 'backups' ? join(f.home, 'backups') : join(backupRoot(f.home), '.pending')
+    if (kind === 'staging') await mkdir(backupRoot(f.home), { recursive: true })
+    await symlink(outside, link)
+    await assert.rejects(createBackup(f.ctx, f.id, f.options), { code: 'session-backup/unsafe-path' })
+    assert.deepEqual(await readdir(outside), ['sentinel'])
+  }))
+}
+
+test('a linked backup group cannot redirect restore or removal', () => fixture(async f => {
+  const backup = await createBackup(f.ctx, f.id, f.options)
+  const group = join(backupRoot(f.home), f.id)
+  const outside = join(f.home, 'outside-backups')
+  assert.equal(group, join(f.home, 'backups', 'sessions', f.id))
+  await rename(group, outside)
+  await symlink(outside, group)
+  await assert.rejects(restoreBackup(backup.path, f.options), { code: 'session-backup/unsafe-path' })
+  await assert.rejects(removeBackup(backup.path, f.options), { code: 'session-backup/unsafe-path' })
+  assert.equal(await readFile(join(outside, backup.dirName, 'session.v4.jsonl'), 'utf8'), 'original\n')
+  assert.equal((await lstat(group)).isSymbolicLink(), true)
+}))
+
+test('a linked restore parent is refused before writing live session bytes', () => fixture(async f => {
+  const backup = await createBackup(f.ctx, f.id, f.options)
+  assert.equal(f.dir, join(f.home, 'sessions', 'project', f.id))
+  await rm(f.dir, { recursive: true })
+  const project = join(f.home, 'sessions', 'project')
+  const outside = join(f.home, 'outside-project')
+  await rename(project, outside)
+  await symlink(outside, project)
+  await assert.rejects(restoreBackup(backup.path, f.options), { code: 'session-backup/unsafe-path' })
+  assert.deepEqual(await readdir(outside), [])
+  assert.equal(await exists(backup.path), true)
+}))
+
+test('a changing preflight source can be stopped, but the final backup must contain its closing events', () => fixture(async f => {
+  // Inject one real append while the staged copy is fingerprinted. Allocation,
+  // copying and final verification remain the actual production filesystem code.
+  const original = await readFile(new URL('../index.js', import.meta.url), 'utf8')
+  const artifactsUrl = new URL('../artifacts.js', import.meta.url).href
+  const attachmentsUrl = new URL('../attachments.js', import.meta.url).href
+  const source = original
+    .replace('readdir, readFile, realpath', 'readdir, readFile as nativeReadFile, realpath')
+    .replace("from './artifacts.js'", `from ${JSON.stringify(artifactsUrl)}`)
+    .replace("from './attachments.js'", `from ${JSON.stringify(attachmentsUrl)}`) + `
+let appendedDuringCopy = false
+async function readFile(path, ...args) {
+  const data = await nativeReadFile(path, ...args)
+  if (!appendedDuringCopy && typeof path === 'string' && path.includes('/.pending/') && path.endsWith('/new/session.v4.jsonl')) {
+    appendedDuringCopy = true
+    await writeFile(${JSON.stringify(f.log)}, 'running append\\n', { flag: 'a' })
+  }
+  return data
+}
+`
+  const isolated = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`)
+  isolated.apply(f.ctx, { home: f.home })
+  let stopped = false
+  f.ctx.parallel = async () => { stopped = true; await appendFile(f.log, 'stopped\n') }
+  await f.post('delete', { sessionId: f.id, stopActivity: true })
+  assert.equal(stopped, true, 'a source-changing preflight must not prevent the authorized stop')
+  const copies = await f.backups()
+  assert.equal(copies.length, 1)
+  assert.equal(await readFile(join(copies[0].path, 'session.v4.jsonl'), 'utf8'), 'original\nrunning append\nstopped\n')
+}))
+
+test('legacy linked backups remain visible but cannot block healthy listing or a fresh backup', () => fixture(async f => {
+  const legacy = await createBackup(f.ctx, f.id, f.options)
+  const outside = join(f.home, 'legacy-link-target')
+  await writeFile(outside, 'unchanged')
+  await symlink(outside, join(legacy.path, 'legacy-link'))
+  const fresh = await createBackup(f.ctx, f.id, { ...f.options, beforeDelete: true })
+  assert.notEqual(fresh.path, legacy.path)
+  const listed = await f.backups()
+  assert.equal(listed.length, 2)
+  assert.equal(listed.find(row => row.path === legacy.path).restorable, false)
+  assert.match(listed.find(row => row.path === legacy.path).warning, /symbolic links/)
+  assert.equal(listed.find(row => row.path === fresh.path).restorable, true)
+  await assert.rejects(restoreBackup(legacy.path, f.options), { code: 'session-backup/unsafe-path' })
+  assert.equal(await readFile(outside, 'utf8'), 'unchanged')
+}))
+
+for (const linkedRoot of ['backups', 'sessions']) {
+  test(`external ${linkedRoot} root overrides reject a linked root before restore or removal`, () => fixture(async f => {
+    const backup = await createBackup(f.ctx, f.id, f.options)
+    const alternateHome = join(f.home, 'alternate-home')
+    await mkdir(alternateHome)
+    const root = linkedRoot === 'backups' ? backupRoot(f.home) : join(f.home, 'sessions')
+    const outside = join(f.home, `outside-${linkedRoot}`)
+    assert.ok(root.startsWith(`${f.home}/`))
+    await rename(root, outside)
+    await symlink(outside, root)
+    const options = { home: alternateHome, backupRoot: backupRoot(f.home), sessionsRoot: join(f.home, 'sessions') }
+    await assert.rejects(restoreBackup(backup.path, options), { code: 'session-backup/unsafe-path' })
+    if (linkedRoot === 'backups') {
+      await assert.rejects(removeBackup(backup.path, options), { code: 'session-backup/unsafe-path' })
+      assert.equal(await readFile(join(outside, f.id, backup.dirName, 'session.v4.jsonl'), 'utf8'), 'original\n')
+    }
+  }))
+}
 
 let failures = 0
 for (const { name, run } of cases) {

@@ -14,9 +14,12 @@ const source = await readFile(clientUrl, 'utf8')
 // Top-level declarations end with an unindented brace; nested braces retain
 // indentation. Fail clearly if that source boundary changes rather than falling
 // back to a separately maintained implementation of the actions.
-const declaration = source.match(/^function createActions\(ctx\) \{\r?\n[\s\S]*?^\}/m)?.[0]
-assert.ok(declaration, 'extract the real createActions declaration from src/client.mjs')
-const script = new Script(`"use strict";\n${declaration}\ncreateActions`, {
+function declaration(name) {
+  const match = source.match(new RegExp(`^function ${name}\\([^\\n]*\\) \\{\\r?\\n[\\s\\S]*?^\\}`, 'm'))
+  assert.ok(match, `extract the real ${name} declaration from src/client.mjs`)
+  return match[0]
+}
+const script = new Script(`"use strict";\n${declaration('createActions')}\ncreateActions`, {
   filename: clientUrl.pathname,
 })
 const plain = value => structuredClone(value)
@@ -27,6 +30,7 @@ function fixture(respond = () => ({ deleted: { deleted: true } })) {
   const failures = []
   const refreshes = []
   const sets = []
+  const leaves = []
   const unexpected = name => () => { throw new Error(`Unexpected client boundary: ${name}`) }
   const context = createContext({
     call: async (action, body) => {
@@ -34,24 +38,26 @@ function fixture(respond = () => ({ deleted: { deleted: true } })) {
       requests.push(request)
       return await respond(request, requests.length)
     },
-    store: {
-      setStatus: status => statuses.push(plain(status)),
-      fail: error => failures.push(plain(error)),
-      // `refreshBackups` marks loading via store.set; recording instead of
-      // throwing lets the action run through to its list fetch.
-      set: value => sets.push(plain(value)),
-      clearSelection: unexpected('store.clearSelection'),
-    },
     messageOf: error => String(error?.message ?? error),
     refreshList: () => refreshes.push('refreshList'),
-    leaveIfCurrent: unexpected('leaveIfCurrent'),
+    leaveIfCurrent: id => leaves.push(id),
     fetch: unexpected('fetch'),
   })
+  const store = new Script(`${declaration('createStore')}\ncreateStore()`).runInContext(context)
+  for (const [method, records] of [['setStatus', statuses], ['fail', failures], ['set', sets]]) {
+    const original = store[method]
+    store[method] = value => { records.push(plain(value)); original(value) }
+  }
+  context.store = store
+  for (const name of ['formatBytes', 'cleanupSettingsOf', 'cleanupSummary', 'attachmentCleanupDetails']) {
+    context[name] = new Script(`${declaration(name)}\n${name}`).runInContext(context)
+  }
   const createActions = script.runInContext(context)
   const actions = createActions({})
   assert.equal(typeof actions.backupOne, 'function')
   assert.equal(typeof actions.deleteOne, 'function')
-  return { actions, requests, statuses, failures, refreshes, sets }
+  return { actions, store, requests, statuses, failures, refreshes, sets, leaves }
+
 }
 
 let passed = 0
@@ -180,4 +186,198 @@ await test('refused restoreOne (already exists) does not refresh the sidebar lis
   assert.equal(f.failures[0].key, 'error.restoreExists')
 })
 
-console.log(`✓ ${passed} client delete-flow tests passed (actual createActions; no network or session writes)`)
+await test('restoreOne surfaces cleanup warnings while preserving its successful placement status', async () => {
+  const f = fixture(({ action }) => action === 'restore'
+    ? { restored: { placement: 'ungrouped', cleanupWarning: 'cleanup marker could not be reset', title: 'Recovered' } }
+    : { backups: [] })
+  await f.actions.restoreOne({ path: 'session-x/backup', title: 'Original' })
+  assert.deepEqual(f.statuses, [{
+    key: 'status.restoredUngrouped', params: { title: 'Recovered', reason: '' },
+    details: ['cleanup marker could not be reset'],
+  }])
+  assert.deepEqual(f.failures, [])
+})
+
+await test('backup-list refresh failure cannot turn a successful restore into a failed restore', async () => {
+  const f = fixture(({ action }) => {
+    if (action === 'restore') return { restored: { attached: true, backupConsumed: true, cleanupWarning: 'marker warning' } }
+    throw new Error('list unavailable')
+  })
+  await f.actions.restoreOne({ path: 'session-x/backup', title: 'Recovered' })
+  assert.deepEqual(f.failures, [])
+  assert.deepEqual(f.statuses.at(-1), {
+    key: 'status.restoredDone', params: { title: 'Recovered', reason: '' },
+    details: ['marker warning', { key: 'status.restoreRefreshFailed', params: { message: 'list unavailable' } }],
+  })
+  assert.equal(f.store.getSnapshot().backupsLoading, false)
+  assert.deepEqual(f.refreshes, ['refreshList'])
+})
+
+await test('restore during deletion asks to wait rather than deleting the session again', async () => {
+  const f = fixture(() => { throw Object.assign(new Error('deletion in progress'), { code: 'session-backup/deleting' }) })
+  await f.actions.restoreOne({ path: 'session-x/backup', title: 'Recovered' })
+  assert.deepEqual(f.failures, [{ key: 'error.restoreDeleting', params: {} }])
+  assert.deepEqual(f.requests.map(request => request.action), ['restore'])
+})
+
+await test('standalone backup-list refresh still reports request failures', async () => {
+  const f = fixture(() => { throw new Error('list unavailable') })
+  await f.actions.refreshBackups()
+  assert.deepEqual(f.failures, [{ key: 'error.requestFailed', params: { message: 'list unavailable' } }])
+})
+
+await test('partial batch failure preserves deletion counts, warnings and only the remaining selection', async () => {
+  const ids = ['session-done', 'session-active', 'session-failed', 'session-unattempted']
+  const f = fixture(({ action, body }) => {
+    assert.equal(action, 'delete')
+    if (body.sessionId === ids[0]) return { deleted: {
+      deleted: true, cleanup: { removed: 2, failed: [{ reason: 'object changed' }] }, warnings: ['cache unavailable'],
+    } }
+    if (body.sessionId === ids[1]) throw Object.assign(new Error('running'), { code: 'workspace/session-active' })
+    throw new Error('backup failed')
+  })
+  f.store.set({ ids })
+  await f.actions.deleteMany(ids)
+  assert.deepEqual(plain(f.store.getSnapshot().ids), ids.slice(1))
+  assert.deepEqual(f.requests.map(request => request.body.sessionId), ids.slice(0, 3))
+  assert.deepEqual(f.leaves, [ids[0]])
+  assert.deepEqual(f.refreshes, ['refreshList'])
+  assert.deepEqual(f.failures, [{
+    key: 'error.deleteFailed', params: { message: 'backup failed' }, details: [
+      { key: 'status.batchDeleteProgress', params: { deleted: 1, active: 1, pending: 1, files: 2 } },
+      { key: 'status.deleteWarning', params: { message: 'object changed; cache unavailable' } },
+    ],
+  }])
+})
+
+await test('batch completion displays both active skips and pending cleanup and retains active selections', async () => {
+  const ids = ['session-done', 'session-active']
+  const f = fixture(({ body }) => {
+    if (body.sessionId === ids[1]) throw Object.assign(new Error('running'), { code: 'workspace/session-active' })
+    return { deleted: { cleanup: { removed: 1, failed: [{ reason: 'file changed' }] } } }
+  })
+  f.store.set({ ids })
+  await f.actions.deleteMany(ids)
+  assert.deepEqual(plain(f.store.getSnapshot().ids), [ids[1]])
+  assert.deepEqual(f.statuses, [{ key: 'status.deletedCleanupPending', details: [
+    { key: 'status.batchDeleteProgress', params: { deleted: 1, active: 1, pending: 1, files: 1 } },
+    { key: 'status.deleteWarning', params: { message: 'file changed' } },
+  ] }])
+  assert.deepEqual(f.failures, [])
+})
+
+await test('successful batch surfaces post-delete cache warnings and clears only deleted selections', async () => {
+  const f = fixture(() => ({ deleted: { warnings: ['workspace cache unavailable'] } }))
+  f.store.set({ ids: ['session-done', 'session-selected-later'] })
+  await f.actions.deleteMany(['session-done'])
+  assert.deepEqual(plain(f.store.getSnapshot().ids), ['session-selected-later'])
+  assert.deepEqual(f.statuses, [{ key: 'status.deleted', params: { count: 1, files: 0 }, details: [
+    { key: 'status.deleteWarning', params: { message: 'workspace cache unavailable' } },
+  ] }])
+})
+
+await test('batch deletion aggregates uploaded object counts and retains references without a failure status', async () => {
+  const ids = ['session-a', 'session-b']
+  const f = fixture(({ body }) => ({ deleted: {
+    cleanup: { removed: 1, failed: [] }, attachments: body.sessionId === ids[0]
+      ? { removed: 2, bytes: 1024, retained: 2, deferred: 1, failed: [] }
+      : { removed: 1, bytes: 1024, retained: 1, deferred: 0, failed: [] },
+  } }))
+  f.store.set({ ids })
+  await f.actions.deleteMany(ids)
+  assert.deepEqual(f.statuses, [{ key: 'status.deletedManyCleaned', params: { count: 2, files: 5 }, details: [
+    { key: 'status.attachmentsCleaned', params: { count: 3, bytes: '2.0 KB' } },
+    { key: 'status.attachmentsRetained', params: { count: 3 } },
+    { key: 'status.attachmentsDeferred', params: { count: 1 } },
+  ] }])
+  assert.deepEqual(f.failures, [])
+  assert.deepEqual(plain(f.store.getSnapshot().ids), [])
+})
+
+await test('batch attachment failures preserve actual counts and warnings when a later delete fails', async () => {
+  const ids = ['session-a', 'session-failed']
+  const f = fixture(({ body }) => {
+    if (body.sessionId === ids[1]) throw new Error('backup failed')
+    return { deleted: { attachments: {
+      removed: 2, bytes: 50, retained: 1, deferred: 0, failed: [{ id: 'upload', reason: 'upload changed' }],
+    } } }
+  })
+  f.store.set({ ids })
+  await f.actions.deleteMany(ids)
+  assert.deepEqual(f.failures, [{ key: 'error.deleteFailed', params: { message: 'backup failed' }, details: [
+    { key: 'status.batchDeleteProgress', params: { deleted: 1, active: 0, pending: 1, files: 2 } },
+    { key: 'status.attachmentsCleaned', params: { count: 2, bytes: '50 B' } },
+    { key: 'status.attachmentsRetained', params: { count: 1 } },
+    { key: 'status.attachmentsFailed', params: { count: 1, message: 'upload changed' } },
+  ] }])
+  assert.deepEqual(plain(f.store.getSnapshot().ids), [ids[1]])
+})
+
+await test('completed batch attachment failures explicitly report cleanup pending', async () => {
+  const f = fixture(() => ({ deleted: { attachments: {
+    removed: 1, bytes: 30, retained: 0, deferred: 0, failed: [{ id: 'upload', code: 'invalid-candidate' }],
+  } } }))
+  await f.actions.deleteMany(['session-a'])
+  assert.equal(f.statuses.at(-1).key, 'status.deletedCleanupPending')
+  assert.deepEqual(f.statuses.at(-1).details.at(-1), {
+    key: 'status.attachmentsFailed', params: { count: 1, message: 'invalid-candidate' },
+  })
+  assert.deepEqual(f.failures, [])
+})
+
+await test('backup removal reports actual upload reclamation, retained copies and failure reasons', async () => {
+  const f = fixture(({ action }) => action === 'remove' ? { removed: { attachments: {
+    removed: 4, bytes: 3072, retained: 2, deferred: 1, failed: [{ id: 'upload', reason: 'file changed' }],
+  } } } : { backups: [] })
+  await f.actions.removeOne({ path: 'session-x/backup', title: 'Backup' })
+  assert.deepEqual(f.requests, [
+    { action: 'remove', body: { path: 'session-x/backup' } },
+    { action: 'list', body: undefined },
+  ])
+  assert.deepEqual(f.statuses, [{ key: 'status.backupRemoved', params: {}, details: [
+    { key: 'status.attachmentsCleaned', params: { count: 4, bytes: '3.0 KB' } },
+    { key: 'status.attachmentsRetained', params: { count: 2 } },
+    { key: 'status.attachmentsDeferred', params: { count: 1 } },
+    { key: 'status.attachmentsFailed', params: { count: 1, message: 'file changed' } },
+  ] }])
+  assert.deepEqual(f.failures, [])
+})
+
+await test('a backup-list refresh failure preserves successful removal, reclamation and the removed row', async () => {
+  const backup = { path: 'session-x/backup', title: 'Backup' }
+  const remaining = { path: 'session-y/backup', title: 'Remaining' }
+  const f = fixture(({ action }) => {
+    if (action === 'remove') return { removed: { attachments: { removed: 2, bytes: 128, retained: 0, deferred: 0, failed: [] } } }
+    throw new Error('list unavailable')
+  })
+  f.store.set({ backups: [backup, remaining], removePending: backup.path })
+  await f.actions.removeOne(backup)
+  assert.deepEqual(f.failures, [])
+  assert.deepEqual(f.statuses.at(-1), { key: 'status.backupRemoved', params: {}, details: [
+    { key: 'status.attachmentsCleaned', params: { count: 2, bytes: '128 B' } },
+    { key: 'status.backupRemoveRefreshFailed', params: { message: 'list unavailable' } },
+  ] })
+  assert.deepEqual(plain(f.store.getSnapshot().backups), [remaining])
+  assert.equal(f.store.getSnapshot().removePending, null)
+  assert.equal(f.store.getSnapshot().backupsLoading, false)
+})
+
+await test('refused backup removal keeps the backup row and does not refresh the list', async () => {
+  const backup = { path: 'session-x/backup', title: 'Backup' }
+  const f = fixture(() => { throw new Error('backup in use') })
+  f.store.set({ backups: [backup] })
+  await f.actions.removeOne(backup)
+  assert.deepEqual(f.failures, [{ key: 'error.requestFailed', params: { message: 'backup in use' } }])
+  assert.deepEqual(plain(f.store.getSnapshot().backups), [backup])
+  assert.deepEqual(f.requests.map(request => request.action), ['remove'])
+  assert.deepEqual(f.statuses, [])
+})
+
+await test('legacy backup removal responses still report success', async () => {
+  const f = fixture(({ action }) => action === 'remove' ? {} : { backups: [] })
+  await f.actions.removeOne({ path: 'session-x/backup' })
+  assert.deepEqual(f.statuses, [{ key: 'status.backupRemoved', params: {} }])
+  assert.deepEqual(f.failures, [])
+})
+
+console.log(`✓ ${passed} client delete-flow tests passed (actual createActions/store; no network or session writes)`)

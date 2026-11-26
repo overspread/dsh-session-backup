@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-backup",
-  "version": "0.4.5-preview.0",
+  "version": "0.4.5-preview.1",
   "description": "Backup every session before it is deleted, permanently delete sessions (spec-exact cascade: activity gate, schedule purge, log + caches, workspace accounting), batch-select sessions in the Web GUI, and restore a backup in one click",
   "keywords": [
     "deepseek-harness",
@@ -29,6 +29,7 @@
   "files": [
     "index.js",
     "artifacts.js",
+    "attachments.js",
     "client.js",
     "cordis.patch.yml",
     "README.md",
@@ -50,7 +51,7 @@
   },
   "scripts": {
     "build": "node scripts/build-client.mjs",
-    "test": "node test/delete-routes.mjs && node test/restore-route.mjs && node test/reuse-backup.mjs && node test/backup-delete-regression.mjs && node test/client-delete-flow.mjs && node test/artifacts.mjs && node test/cleanup-routes.mjs && node test/client-cleanup-flow.mjs && node --test test/cleanup-concurrency.mjs"
+    "test": "node test/delete-routes.mjs && node test/restore-route.mjs && node test/reuse-backup.mjs && node test/backup-delete-regression.mjs && node test/client-delete-flow.mjs && node test/artifacts.mjs && node test/cleanup-routes.mjs && node test/client-cleanup-flow.mjs && node test/attachments.mjs && node test/attachment-routes.mjs && node --test test/cleanup-concurrency.mjs"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.0.5-alpha.2"

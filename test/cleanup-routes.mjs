@@ -175,7 +175,10 @@ test('apply exposes seven actual routes and default-off settings, including edit
   assert.deepEqual([...f.routes.keys()].sort(), [
     'cleanup-retry', 'cleanup-settings', 'create', 'delete', 'list', 'remove', 'restore',
   ].map(action => `${API}.${action}`).sort())
-  assert.deepEqual(await f.settings(), { cleanupOnDelete: false, editable: true, pending: [] })
+  assert.deepEqual(await f.settings(), {
+    cleanupOnDelete: false, cleanupAttachmentsOnDelete: false,
+    editable: true, pending: [], attachmentPending: [],
+  })
   assert.equal(typeof f.facade()?.save, 'function')
 }))
 
@@ -224,7 +227,7 @@ test('enabled cleanup follows final backup and log removal, preserving every unr
     assert.equal(await exists(owned.path), true)
     sawRemovedLogBeforeArtifactCleanup = true
   }
-  const { deleted } = await f.success('delete', { sessionId: f.id, cleanupOnDelete: false })
+  const { deleted } = await f.success('delete', { sessionId: f.id, stopActivity: true, cleanupOnDelete: false })
   assert.equal(sawFinalBackup, true)
   assert.equal(sawRemovedLogBeforeArtifactCleanup, true)
   assert.deepEqual(deleted.cleanup, { removed: 2, bytes: owned.bytes + second.bytes, retained: 0, failed: [] })
@@ -269,7 +272,7 @@ test('a stop/schedule purge failure preserves the log and artifacts without crea
   assert.equal(await exists(artifact.path), true)
   assert.equal(await pendingFor(f), undefined)
   assert.equal(f.state.removes, 0)
-  assert.equal((await f.backups()).length, 0)
+  assert.equal((await f.backups()).length, 1, 'preflight retains a safe backup before stopping or purging reminders')
   f.services.delete('schedule')
   assert.equal((await f.success('delete', { sessionId: f.id })).deleted.cleanup.removed, 1)
 }, { cleanupOnDelete: true }))
@@ -460,6 +463,33 @@ test('the producer facade refuses allocation when persisted session state cannot
   await assert.rejects(save(f), error => error.code === 'session/not-found')
   assert.equal(await exists(join(f.home, 'session-artifacts')), false)
 }))
+
+test('a corrupt ledger is reported without blocking settings or healthy pending cleanup', () => fixture(async f => {
+  const healthy = await save(f, 'healthy.png', 'healthy')
+  const other = await f.createSession()
+  const corrupt = await save(f, 'corrupt.png', 'retained', other.id)
+  await f.store.markPending(f.id)
+  await f.store.markPending(other.id)
+  await f.removeOwned(f.dir, { recursive: true })
+  await f.removeOwned(other.dir, { recursive: true })
+  f.live.delete(f.id)
+  f.live.delete(other.id)
+  const ledger = join(f.home, 'session-artifacts', 'registry', `${other.id}.json`)
+  await writeFile(await f.verifyOwned(ledger), '{broken-json')
+  const settings = await f.settings()
+  assert.deepEqual(settings.pending.map(row => row.sessionId), [f.id])
+  assert.equal(settings.pendingErrors.length, 1)
+  assert.equal(settings.pendingErrors[0].sessionId, other.id)
+  assert.equal(typeof settings.pendingErrors[0].reason, 'string')
+  const result = await f.success('cleanup-retry', {})
+  assert.equal(result.results.find(row => row.sessionId === f.id).removed, 1)
+  assert.equal(result.results.find(row => row.sessionId === other.id).failed.length, 1)
+  assert.equal(await exists(healthy.path), false)
+  assert.equal(await readFile(corrupt.path, 'utf8'), 'retained')
+  assert.equal(await readFile(ledger, 'utf8'), '{broken-json')
+  assert.deepEqual(result.settings.pending, [])
+  assert.equal(result.settings.pendingErrors[0].sessionId, other.id)
+}, { cleanupOnDelete: true }))
 
 let failures = 0
 for (const { name, run } of cases) {

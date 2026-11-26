@@ -176,7 +176,7 @@ async function expectLedger(paths, sessionId, expected) {
   return path
 }
 
-async function writeLedger(paths, value, expected) {
+async function writeLedger(paths, value, expected, onPublished) {
   await checkLayout(paths)
   const temporary = inside(paths.registry, join(paths.registry, `.${value.sessionId}-${randomBytes(16).toString('hex')}.tmp`))
   const body = `${JSON.stringify(value)}\n`
@@ -198,6 +198,9 @@ async function writeLedger(paths, value, expected) {
     if (!same(written, staging)) throw fail('Artifact ledger staging file was replaced')
     await rename(temporary, path)
     published = true
+    // Publication already made these entries visible. A later durability error
+    // must not let save() remove an object this ledger now owns.
+    onPublished?.()
     await syncDirectory(paths.registry)
     return { value, stat: snapshot(await lstat(path, { bigint: true })) }
   } finally {
@@ -315,6 +318,7 @@ export class SessionArtifactStore {
       const path = inside(session, join(session, `${id}-${name}`))
       let handle
       let entry
+      let published = false
       try {
         await objectPath(paths, sessionId, { id, name })
         handle = await open(path, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR | NOFOLLOW, 0o600)
@@ -332,12 +336,12 @@ export class SessionArtifactStore {
         await syncDirectory(session)
         await writeLedger(paths, {
           version: 1, sessionId, pending: false, entries: [...(ledger?.value.entries ?? []), entry],
-        }, ledger?.stat ?? null)
+        }, ledger?.stat ?? null, () => { published = true })
         return { id, sessionId, path, bytes: bytes.length }
       } catch (error) {
         await handle?.close()
         handle = undefined
-        if (entry !== undefined) {
+        if (entry !== undefined && !published) {
           try { await removeEntry(paths, sessionId, entry) } catch { /* Preserve changed/unregistered files. */ }
         }
         throw error
@@ -368,15 +372,25 @@ export class SessionArtifactStore {
     })
   }
 
-  async pending() {
+  /** Discover healthy pending inventories; report and retain unreadable ledgers individually. */
+  async pending({ onError } = {}) {
+    if (onError !== undefined && typeof onError !== 'function') {
+      throw fail('onError must be a function', 'ARTIFACTS_INVALID')
+    }
     return await this.run(false, () => [], async paths => {
       const result = []
       for (const file of (await readdir(paths.registry)).sort()) {
         if (!file.endsWith('.json')) continue
         const sessionId = file.slice(0, -5)
         try { sessionIdOf(sessionId) } catch { continue }
-        const ledger = await readLedger(paths, sessionId)
-        if (ledger?.value.pending) result.push({ sessionId, count: ledger.value.entries.length })
+        try {
+          const ledger = await readLedger(paths, sessionId)
+          if (ledger?.value.pending) result.push({ sessionId, count: ledger.value.entries.length })
+        } catch (error) {
+          // A damaged or unsafe inventory must neither hide healthy sessions nor
+          // be rewritten/deleted just because it cannot be read safely.
+          onError?.({ sessionId, code: error?.code ?? 'ARTIFACTS_INVALID', reason: String(error?.message ?? error) })
+        }
       }
       return result
     })

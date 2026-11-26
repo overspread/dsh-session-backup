@@ -1,33 +1,34 @@
 /**
  * Session backup + permanent deletion — Host face.
  *
- * Owns two things: the on-disk backup store (`$DSH_HOME/backups/sessions/<sessionId>/<stamp>-<title>/`)
- * and the five HTTP routes the Web GUI calls (four backup routes plus `delete`).
+ * Owns the on-disk backup store (`$DSH_HOME/backups/sessions/<sessionId>/<stamp>-<title>/`),
+ * the registered temporary-artifact and upload-candidate ledgers, and their Web GUI routes.
  * Every operation is a plain filesystem routine taking explicit roots, so the
  * tests drive them against a temp directory without booting a profile.
  *
  * A backup is a recursive copy of the session's own directory plus a
- * `backup.json` manifest describing what was taken. Attachments are
- * content-addressed and are NOT purged when a session is deleted, so the
- * session directory alone is a complete, restorable copy. Identical contents
- * reuse a stored copy. A delete refreshes the latest backup after stopping
+ * `backup.json` manifest describing what was taken. Content-addressed uploads
+ * remain in the local attachment store; retained backup references protect them
+ * from optional collection. Backups are not standalone attachment archives.
+ * Identical contents reuse a stored copy. A delete refreshes the latest backup after stopping
  * work, so a manual backup followed by deletion retains one up-to-date copy.
  *
  * The delete engine (below, `deleteSessionCascade`) reproduces the harness's
  * permanent-deletion cascade as a self-contained plugin, so a profile whose
  * kernel has no `session/deleteSession` (upstream ≥ 0.2.1-alpha.5, rc line)
- * gains the same guarantees: activity gate with a stop-activity upgrade,
- * scheduled-reminder row purge before anything is destroyed, write-lease
- * probe, durable log removal, and a best-effort derived-cache cascade that
- * can never resurrect a deleted Session. Cascade steps are probed through
+ * applies an activity gate, backup preflight, optional authorized stop,
+ * write-lease probe and strict final backup before purging reminders and
+ * removing the durable log. Derived-cache cleanup follows as best effort;
+ * cache failures are returned as warnings and can be retried. Cascade steps are probed through
  * `ctx.get()` and feature-detected at call time, so the same file runs on
  * both the local alpha.3 build (richer service APIs) and upstream rc.2.
  */
-import { copyFile, cp, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, rmdir, stat, writeFile } from 'node:fs/promises'
+import { copyFile, cp, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, rmdir, stat, writeFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { SessionArtifactStore } from './artifacts.js'
+import { AttachmentCleanupStore, observeAttachmentUse, withAttachmentReferences } from './attachments.js'
 
 export const name = 'session-backup'
 
@@ -40,13 +41,15 @@ export const Config = {
       if (value === null || typeof value !== 'object' || Array.isArray(value)) {
         return { issues: [{ message: 'Session backup configuration must be an object' }] }
       }
-      if (value.cleanupOnDelete !== undefined && typeof value.cleanupOnDelete !== 'boolean') {
-        return { issues: [{ message: 'cleanupOnDelete must be a boolean', path: ['cleanupOnDelete'] }] }
+      for (const key of ['cleanupOnDelete', 'cleanupAttachmentsOnDelete']) {
+        if (value[key] !== undefined && typeof value[key] !== 'boolean') {
+          return { issues: [{ message: `${key} must be a boolean`, path: [key] }] }
+        }
       }
       if (value.home !== undefined && (typeof value.home !== 'string' || value.home.trim() === '')) {
         return { issues: [{ message: 'home must be a nonempty path', path: ['home'] }] }
       }
-      return { value: { ...value, cleanupOnDelete: value.cleanupOnDelete ?? false } }
+      return { value: { ...value, cleanupOnDelete: value.cleanupOnDelete ?? false, cleanupAttachmentsOnDelete: value.cleanupAttachmentsOnDelete ?? false } }
     },
   },
 }
@@ -190,8 +193,47 @@ function assertRequestPath(path) {
 // Filesystem primitives
 // ---------------------------------------------------------------------------
 
-const isDirectory = (path) => stat(path).then((info) => info.isDirectory(), () => false)
-const pathExists = (path) => stat(path).then(() => true, () => false)
+async function entryInfo(path) {
+  try { return await lstat(path) }
+  catch (error) {
+    if (error.code === 'ENOENT') return undefined
+    throw error
+  }
+}
+
+const pathExists = async (path) => await entryInfo(path) !== undefined
+const unsafePath = (path) => failure('session-backup/unsafe-path', `symbolic links and non-directory store paths are not supported: ${path}`, 409)
+
+/** Check every directory component below a trusted store anchor, without following links. */
+async function assertDirectoryPath(root, target, allowMissing = false) {
+  const base = resolve(root)
+  const path = resolve(target)
+  if (path !== base) assertInside(base, path, 'store path')
+  let current = base
+  const parts = path === base ? [] : relative(base, path).split(sep)
+  for (let index = -1; index < parts.length; index += 1) {
+    if (index >= 0) current = join(current, parts[index])
+    const info = await entryInfo(current)
+    if (info === undefined && allowMissing) return false
+    if (info === undefined) throw notFound(`no directory at ${current}`)
+    if (!info.isDirectory() || info.isSymbolicLink()) throw unsafePath(current)
+  }
+  return true
+}
+
+/** Explicit root overrides can live outside home; their parent is the caller's anchor. */
+async function assertStoreDirectory(home, target, allowMissing = false) {
+  const relation = relative(resolve(home), resolve(target))
+  const inside = relation === '' || (relation !== '..' && !relation.startsWith(`..${sep}`) && !isAbsolute(relation))
+  return assertDirectoryPath(inside ? home : dirname(target), target, allowMissing)
+}
+
+async function safeCopyEntry(path) {
+  if (SKIP_NAMES.has(basename(path))) return false
+  const info = await lstat(path)
+  if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory())) throw unsafePath(path)
+  return true
+}
 
 const relKey = (base, path) => relative(base, path).split(sep).join('/')
 
@@ -200,15 +242,17 @@ const relKey = (base, path) => relative(base, path).split(sep).join('/')
  * @returns `[{ path, rel, bytes, mtimeMs }]` with `/`-separated relative keys.
  */
 export async function walkFiles(dir, base = dir, found = []) {
+  await assertDirectoryPath(base, dir)
   const entries = await readdir(dir, { withFileTypes: true })
   for (const entry of entries) {
+    if (SKIP_NAMES.has(entry.name)) continue
     const path = join(dir, entry.name)
-    if (entry.isDirectory()) {
+    const info = await lstat(path)
+    if (info.isSymbolicLink() || (!info.isFile() && !info.isDirectory())) throw unsafePath(path)
+    if (info.isDirectory()) {
       await walkFiles(path, base, found)
       continue
     }
-    if (!entry.isFile() || SKIP_NAMES.has(entry.name)) continue
-    const info = await stat(path)
     found.push({ path, rel: relKey(base, path), bytes: info.size, mtimeMs: info.mtimeMs })
   }
   return found
@@ -222,16 +266,12 @@ export async function walkFiles(dir, base = dir, found = []) {
  */
 export async function locateSessionDir(sessionId, root) {
   assertSessionId(sessionId)
-  let projects
-  try {
-    projects = await readdir(root, { withFileTypes: true })
-  } catch {
-    return undefined
-  }
+  if (!(await assertDirectoryPath(root, root, true))) return undefined
+  const projects = await readdir(root, { withFileTypes: true })
   for (const entry of projects) {
     if (!entry.isDirectory()) continue
     const candidate = join(root, entry.name, sessionId)
-    if (await isDirectory(candidate)) return candidate
+    if (await assertDirectoryPath(root, candidate, true)) return candidate
   }
   return undefined
 }
@@ -292,7 +332,8 @@ async function copyStableFile(sourcePath, destinationPath) {
  * never settles is reported instead of silently shipping a torn log.
  */
 export async function copySessionDir(source, destination) {
-  await cp(source, destination, { recursive: true, filter: (path) => !SKIP_NAMES.has(basename(path)) })
+  await assertDirectoryPath(source, source)
+  await cp(source, destination, { recursive: true, errorOnExist: true, force: false, filter: safeCopyEntry })
   const sourceFiles = await walkFiles(source)
   const copies = new Map((await walkFiles(destination)).map((file) => [file.rel, file]))
   const inconsistent = []
@@ -325,6 +366,8 @@ async function uniqueBackupName(backups, sessionId, stamp, title) {
 async function readManifest(dir) {
   let parsed
   try {
+    const info = await lstat(join(dir, MANIFEST_FILE))
+    if (!info.isFile() || info.isSymbolicLink()) return undefined
     parsed = JSON.parse(await readFile(join(dir, MANIFEST_FILE), 'utf8'))
   } catch {
     return undefined
@@ -372,6 +415,13 @@ async function storedBackups(group, sessionId, source) {
     const path = assertInside(group, join(group, entry.name), 'stored backup')
     const manifest = await readManifest(path)
     if (manifest?.sessionId !== sessionId || manifest.sourcePath !== source || manifest.consistent !== true) continue
+    try { await walkFiles(path) }
+    catch (error) {
+      // Older versions could copy links. Retain such history, but never reuse
+      // or replace it as a trusted independent backup.
+      if (error.code === 'session-backup/unsafe-path') continue
+      throw error
+    }
     copies.push({ ...manifest, dirName: entry.name, path })
   }
   return copies.sort((left, right) => right.createdAt.localeCompare(left.createdAt)
@@ -393,7 +443,7 @@ const backupWrites = new Map()
 export async function createBackup(ctx, sessionId, options = {}) {
   assertSessionId(sessionId)
   const backups = options.backupRoot ?? backupRoot(options.home ?? dshHome())
-  return withBackupGroup(resolve(backups, sessionId), () => createBackupNow(ctx, sessionId, options))
+  return withBackupGroup(resolve(backups, sessionId), () => withAttachmentReferences(options.home ?? dshHome(), () => createBackupNow(ctx, sessionId, options)))
 }
 
 async function withBackupGroup(key, run) {
@@ -413,7 +463,7 @@ function backupGroupForPath(backups, path) {
   const segments = relative(resolve(backups), target).split(sep)
   if (segments.length !== 2) throw badRequest('backup path must name one backup entry')
   const sessionId = assertSessionId(segments[0])
-  if (deleting.has(sessionId)) throw conflict('the session is being deleted; retry after deletion completes')
+  if (deleting.has(sessionId)) throw failure('session-backup/deleting', 'the session is being deleted; retry after deletion completes', 409)
   return dirname(target)
 }
 
@@ -421,10 +471,13 @@ async function createBackupNow(ctx, sessionId, options) {
   const home = options.home ?? dshHome()
   const sessions = options.sessionsRoot ?? sessionsRoot(home)
   const backups = options.backupRoot ?? backupRoot(home)
+  await assertStoreDirectory(home, sessions)
+  await assertStoreDirectory(home, backups, true)
   const source = await locateSessionDir(sessionId, sessions)
   if (source === undefined) throw notFound(`session "${sessionId}" has no directory under ${sessions}`)
   await flushLiveSession(ctx, sessionId)
   const group = assertInside(backups, join(backups, sessionId), 'backup group')
+  await assertStoreDirectory(home, group, true)
   const copies = await storedBackups(group, sessionId, source)
   const wanted = await inventoryOf(source)
   for (const copy of copies) {
@@ -441,7 +494,9 @@ async function createBackupNow(ctx, sessionId, options) {
   const destination = assertInside(group, join(group, dirName), 'backup destination')
   // Staging is outside session groups, so list/match never expose partial copies.
   const pendingRoot = join(backups, '.pending')
+  await assertStoreDirectory(home, pendingRoot, true)
   await mkdir(pendingRoot, { recursive: true })
+  await assertStoreDirectory(home, pendingRoot)
   const staging = assertInside(pendingRoot, await mkdtemp(join(pendingRoot, `${sessionId}-`)), 'backup staging')
   const prepared = join(staging, 'new')
   const previous = join(staging, 'previous')
@@ -452,7 +507,7 @@ async function createBackupNow(ctx, sessionId, options) {
     const current = await inventoryOf(source)
     if (copied.inconsistent.length > 0 || inventory.length !== current.length
       || !inventory.every((line, index) => line === current[index])) {
-      throw conflict('session changed while its backup was copied; retry after the session becomes idle')
+      throw failure('session-backup/source-changing', 'session changed while its backup was copied; retry after the session becomes idle', 409)
     }
     const manifest = {
       version: MANIFEST_VERSION,
@@ -515,7 +570,13 @@ export async function listBackups(root) {
       if (!entry.isDirectory()) continue
       const path = join(root, group.name, entry.name)
       const manifest = await readManifest(path)
-      const files = await walkFiles(path)
+      let files = []
+      let warning
+      try { files = await walkFiles(path) }
+      catch (error) {
+        if (error.code !== 'session-backup/unsafe-path') throw error
+        warning = error.message
+      }
       backups.push({
         path,
         sessionId: manifest?.sessionId ?? group.name,
@@ -524,8 +585,9 @@ export async function listBackups(root) {
         createdAt: manifest?.createdAt ?? isoFromStamp(entry.name.slice(0, 15)) ?? '',
         bytes: manifest?.bytes ?? files.reduce((sum, file) => sum + file.bytes, 0),
         files: manifest?.files ?? files.length,
-        consistent: manifest?.consistent ?? true,
-        restorable: manifest !== undefined && typeof manifest.sourcePath === 'string',
+        consistent: warning === undefined && (manifest?.consistent ?? true),
+        restorable: warning === undefined && manifest !== undefined && typeof manifest.sourcePath === 'string',
+        ...(warning === undefined ? {} : { warning }),
       })
     }
   }
@@ -594,7 +656,7 @@ export async function reattachRestoredSession(registry, sessionId) {
 export async function restoreBackup(path, options = {}) {
   const backups = options.backupRoot ?? backupRoot(options.home ?? dshHome())
   const group = backupGroupForPath(backups, path)
-  return withBackupGroup(group, () => restoreBackupNow(path, options))
+  return withBackupGroup(group, () => withAttachmentReferences(options.home ?? dshHome(), () => restoreBackupNow(path, options)))
 }
 
 async function restoreBackupNow(path, options) {
@@ -602,6 +664,10 @@ async function restoreBackupNow(path, options) {
   const sessions = options.sessionsRoot ?? sessionsRoot(home)
   const backups = options.backupRoot ?? backupRoot(home)
   const source = assertInside(backups, path, 'backup path')
+  await assertStoreDirectory(home, backups)
+  await assertDirectoryPath(backups, source)
+  // Inspect the complete tree before creating any live-session directory.
+  await walkFiles(source)
   const manifest = await readManifest(source)
   if (manifest === undefined) throw badRequest(`backup at ${source} has no usable ${MANIFEST_FILE} manifest`)
   const sessionId = assertSessionId(manifest.sessionId)
@@ -610,11 +676,17 @@ async function restoreBackupNow(path, options) {
   }
   const destination = assertInside(sessions, manifest.sourcePath, 'manifest sourcePath')
   if (basename(destination) !== sessionId) throw badRequest('manifest sourcePath does not end in its sessionId')
+  await assertStoreDirectory(home, sessions, true)
+  await assertDirectoryPath(sessions, dirname(destination), true)
   if (await pathExists(destination)) throw conflict(`session "${sessionId}" already exists at ${destination}`)
   await mkdir(dirname(destination), { recursive: true })
+  await assertStoreDirectory(home, sessions)
+  await assertDirectoryPath(sessions, dirname(destination))
   await cp(source, destination, {
     recursive: true,
-    filter: (entry) => basename(entry) !== MANIFEST_FILE && !SKIP_NAMES.has(basename(entry)),
+    errorOnExist: true,
+    force: false,
+    filter: async (entry) => basename(entry) !== MANIFEST_FILE && await safeCopyEntry(entry),
   })
   // Restoration already copied the log; an unsafe/unreadable optional registry
   // cannot turn it into a generic failure before attachment and pinning. Retry
@@ -668,14 +740,24 @@ async function restoreBackupNow(path, options) {
 export async function removeBackup(path, options = {}) {
   const backups = options.backupRoot ?? backupRoot(options.home ?? dshHome())
   const group = backupGroupForPath(backups, path)
-  return withBackupGroup(group, () => removeBackupNow(path, options))
+  return withBackupGroup(group, () => withAttachmentReferences(options.home ?? dshHome(), async () => {
+    let sessionId
+    if (options.cleanupAttachmentsOnDelete === true) {
+      sessionId = assertSessionId(basename(group))
+      await new AttachmentCleanupStore(options.home ?? dshHome(), options).capture(sessionId, path)
+    }
+    const result = await removeBackupNow(path, options)
+    if (sessionId !== undefined) result.attachments = await cleanupQueuedAttachments(options.ctx, sessionId, { ...options, home: options.home ?? dshHome() }, options.attachmentGuard)
+    return result
+  }))
 }
 
 async function removeBackupNow(path, options) {
   const home = options.home ?? dshHome()
   const backups = options.backupRoot ?? backupRoot(home)
   const target = assertInside(backups, path, 'backup path')
-  if (!(await pathExists(target))) throw notFound(`no backup at ${target}`)
+  await assertStoreDirectory(home, backups)
+  if (!(await assertDirectoryPath(backups, target, true))) throw notFound(`no backup at ${target}`)
   await rm(target, { recursive: true, force: true })
   const group = dirname(target)
   if (group !== backups) {
@@ -717,6 +799,13 @@ const internalError = (sessionId, what, cause) =>
 
 /** Persistence error names used by both the alpha.3 and rc.2 jsonl backends. */
 const isNotFoundErr = (e) => e?.name === 'SessionPersistenceNotFoundError'
+async function sessionSnapshot(persistence, sessionId) {
+  try { return await persistence.stat(sessionId) }
+  catch (error) {
+    if (isNotFoundErr(error)) return undefined
+    throw error
+  }
+}
 const isBusyErr = (e) =>
   e?.name === 'SessionPersistenceActiveError' || e?.name === 'SessionAlreadyOwnedError'
 
@@ -749,7 +838,7 @@ async function askActivity(ctx, sessionId) {
  * kernel's code): deleting the log under armed rows leaves a delivery loop
  * hammering a resurrected Session.
  */
-async function stopActivityAndPurgeSchedule(ctx, sessionId) {
+async function stopSessionActivity(ctx, sessionId) {
   if (typeof ctx.parallel === 'function') {
     try {
       await ctx.parallel('workspace/session-stop', { sessionId })
@@ -757,6 +846,9 @@ async function stopActivityAndPurgeSchedule(ctx, sessionId) {
       ctx.logger?.warn?.(`session-backup: session-stop providers failed for '${sessionId}': ${String(error)}`)
     }
   }
+}
+
+async function purgeSchedule(ctx, sessionId) {
   const schedule = ctx.get('schedule')
   if (schedule === undefined || schedule === null) return
   try {
@@ -920,7 +1012,7 @@ async function removeStored(ctx, sessionId, paths) {
     throw busyError(sessionId, [])
   }
   // No remove(): stat proves existence, the probe above proved exclusivity.
-  const snapshot = typeof persistence.stat === 'function' ? await persistence.stat(sessionId) : undefined
+  const snapshot = typeof persistence.stat === 'function' ? await sessionSnapshot(persistence, sessionId) : undefined
   if (snapshot === undefined || snapshot === null) {
     if (removed.has(sessionId)) return
     throw notFoundError(sessionId)
@@ -928,7 +1020,7 @@ async function removeStored(ctx, sessionId, paths) {
   const dir = await locateSessionDir(sessionId, paths.sessionsRoot)
   if (dir === undefined) throw internalError(sessionId, 'its log directory could not be located', new Error('no directory'))
   await rm(dir, { recursive: true, force: true })
-  const after = typeof persistence.stat === 'function' ? await persistence.stat(sessionId) : undefined
+  const after = typeof persistence.stat === 'function' ? await sessionSnapshot(persistence, sessionId) : undefined
   if (after !== undefined && after !== null) {
     throw internalError(sessionId, 'its log directory survived removal', new Error(`still visible at ${dir}`))
   }
@@ -1020,7 +1112,7 @@ export async function deleteSessionCascade(ctx, sessionId, options = {}) {
   const group = resolve(paths.backupRoot ?? backupRoot(paths.home ?? dshHome()), sessionId)
   // Restore, deletion (including orphaned logs), and artifact cleanup share the
   // same group lock. Re-evaluate session existence only after obtaining it.
-  const operation = withBackupGroup(group, () => runDelete(ctx, sessionId, options.stopActivity === true, paths, options.cleanupOnDelete === true))
+  const operation = withBackupGroup(group, () => withAttachmentReferences(paths.home ?? dshHome(), () => runDelete(ctx, sessionId, options.stopActivity === true, paths, options.cleanupOnDelete === true, options.cleanupAttachmentsOnDelete === true, options.attachmentGuard)))
   deleting.set(sessionId, operation)
   try {
     return await operation
@@ -1055,115 +1147,97 @@ async function hasResidual(ctx, sessionId, paths) {
   return false
 }
 
-async function runDelete(ctx, sessionId, stopActivity, explicitPaths, cleanupOnDelete) {
+async function runDelete(ctx, sessionId, stopActivity, explicitPaths, cleanupOnDelete, cleanupAttachmentsOnDelete, attachmentGuard) {
   const paths = explicitPaths ?? deletePaths()
-  const artifacts = new SessionArtifactStore(paths.home ?? dshHome())
+  const home = paths.home ?? dshHome()
+  const artifacts = new SessionArtifactStore(home)
   const persistence = ctx.get('sessionPersistence')
   const finish = async (result) => {
     removed.add(sessionId)
+    // Derived data is cleared only after proven log removal. Its failure is a
+    // warning on a completed deletion, and an idempotent retry runs it again.
+    const warnings = await cascadeCaches(ctx, sessionId, paths)
     emitRemoved(ctx, sessionId)
-    if (!cleanupOnDelete) return result
-    return { ...result, cleanup: await cleanupDeletedArtifacts(ctx, sessionId, paths, artifacts) }
-  }
-  // Idempotent repeat: this process already destroyed the id.
-  if (removed.has(sessionId)) {
-    const still = persistence !== undefined && persistence !== null && typeof persistence.stat === 'function'
-      ? await persistence.stat(sessionId)
-      : undefined
-    if (still === undefined || still === null) return await finish({ deleted: true })
-  }
-  // A missing log is either a genuinely unknown id (refuse) or a half-deleted
-  // residue whose row the Sidebar still shows (finish the cleanup below).
-  let orphaned = false
-  if (persistence !== undefined && persistence !== null && typeof persistence.stat === 'function') {
-    const snapshot = await persistence.stat(sessionId).catch(() => undefined)
-    if (snapshot === undefined || snapshot === null) {
-      if (!(await hasResidual(ctx, sessionId, paths)) && !(await artifacts.has(sessionId))) throw notFoundError(sessionId)
-      orphaned = true
+    return {
+      ...result,
+      ...(warnings.length === 0 ? {} : { warnings }),
+      ...(cleanupOnDelete ? { cleanup: await cleanupDeletedArtifacts(ctx, sessionId, paths, artifacts) } : {}),
+      ...(cleanupAttachmentsOnDelete ? { attachments: await cleanupQueuedAttachments(ctx, sessionId, paths, attachmentGuard) } : {}),
     }
   }
+  await assertStoreDirectory(home, paths.sessionsRoot, true)
+  let snapshot
+  if (typeof persistence?.stat === 'function') {
+    try { snapshot = await sessionSnapshot(persistence, sessionId) }
+    catch (error) { throw internalError(sessionId, 'its stored state could not be read; nothing was deleted', error) }
+  }
+  const directory = await locateSessionDir(sessionId, paths.sessionsRoot)
+  const orphaned = typeof persistence?.stat === 'function' && snapshot == null && directory === undefined
+  if (orphaned && removed.has(sessionId)) return await finish({ deleted: true })
+  if (orphaned && !(await hasResidual(ctx, sessionId, paths)) && !(await artifacts.has(sessionId))
+      && !(cleanupAttachmentsOnDelete && (await new AttachmentCleanupStore(home, paths).pending()).some(row => row.sessionId === sessionId))) {
+    throw notFoundError(sessionId)
+  }
+  if (!stopActivity) {
+    const activity = await askActivity(ctx, sessionId)
+    if (activity.length > 0) throw busyError(sessionId, activity)
+  }
 
+  const backups = paths.backupRoot ?? backupRoot(home)
+  const saveBackup = async (allowChanging = false) => {
+    try {
+      await createBackupNow(ctx, sessionId, { ...paths, backupRoot: backups, beforeDelete: true })
+    } catch (error) {
+      // A running writer may prevent a consistent preflight snapshot. The user
+      // authorized stopping it; only the post-stop backup must be consistent.
+      if (allowChanging && error.code === 'session-backup/source-changing') return
+      throw internalError(sessionId, 'its final backup could not be saved; the session was not deleted', error)
+    }
+  }
+  // Catch allocation, link and read errors before stop providers can remove
+  // reminders. Stopping activity itself cannot be rolled back; the final copy
+  // below still captures events appended while that stop completes.
+  if (!orphaned) await saveBackup(stopActivity)
+  if (stopActivity) await stopSessionActivity(ctx, sessionId)
+  await quiesceAndDetach(ctx, sessionId)
   if (stopActivity) {
-    await stopActivityAndPurgeSchedule(ctx, sessionId)
-    // Cancel the bare agent and detach the entered entry FIRST: on rc.2 the
-    // teardown capability is unreachable by id, and the write-handle close is
-    // a fire-and-forget tail of `session/disposed` — without this the lease
-    // probe below refuses a stop the user already confirmed.
-    await quiesceAndDetach(ctx, sessionId)
-    // Stop providers are fire-and-warn: a cancelled turn, an aborted job and
-    // the write-handle close each land on their own async tails. Wait until the
-    // activity gate answers empty (the same providers the first confirmation
-    // asked), so the lease probe below does not race a half-settled stop and
-    // refuse as busy. The ceiling is generous; past it the lease probe's own
-    // bounded retry still refuses honestly.
     const settleDeadline = Date.now() + STOP_SETTLE_MAX_MS
     for (;;) {
       const activity = await askActivity(ctx, sessionId)
       if (activity.length === 0) break
-      if (Date.now() >= settleDeadline) break
+      if (Date.now() >= settleDeadline) throw busyError(sessionId, activity)
       await sleep(STOP_SETTLE_POLL_MS)
     }
-  } else {
-    // The gate is the archive gate: same providers, same code, same payload,
-    // so the client's busy-confirm rendering covers deletion unchanged.
-    const activity = await askActivity(ctx, sessionId)
-    if (activity.length > 0) throw busyError(sessionId, activity)
-    // Idle or not, armed schedule rows die first — they would cold-resume the
-    // log this cascade destroys (kernel step order, spec B1 1a).
-    await stopActivityAndPurgeSchedule(ctx, sessionId)
-    // rc.2's kernel store keeps the write handle open for an opened — even
-    // idle — Session until `session/disposed` closes it, so the lease probe
-    // below would exhaust its retries and refuse with an EMPTY activity list:
-    // a refusal the client cannot render as a stop-first upgrade, and the
-    // dead end that broke idle deletes after the rc.2 upgrade (two backups,
-    // no deletion). Detach first — the same seam the stop branch rides.
-    await quiesceAndDetach(ctx, sessionId)
   }
-
   await disposeLiveAgent(ctx, sessionId)
-  // Cache cleanup runs BEFORE the log leaves the disk, and it is no longer
-  // swallowed: a step that fails aborts the delete while the Session is still
-  // whole and retryable. Removing the log first and merely warning on later
-  // failures produced the half-deleted residue this plugin used to 404 on —
-  // a dangling Sidebar row whose only log was already gone.
-  const failed = await cascadeCaches(ctx, sessionId, paths)
-  if (failed.length > 0) {
-    throw internalError(sessionId, `its ${failed.join(', ')} could not be cleared; the session was not deleted`, new Error('cache cleanup failed'))
-  }
   if (orphaned) {
-    // No log left: the activity gate above already stopped work and detached
-    // the live entry, and the cache cascade just ran. The only work left is the
-    // event the Sidebar waits on, so a half-deleted id disappears.
+    // A storage read failure never reaches here: both stat and the filesystem
+    // proved absence before any residual membership or cache is changed.
     if (cleanupOnDelete) await artifacts.markPending(sessionId)
+    await purgeSchedule(ctx, sessionId)
     return await finish({ deleted: true, alreadyGone: true })
   }
-  const backups = paths.backupRoot ?? backupRoot(paths.home ?? dshHome())
   let lease = await acquireDeletionLease(ctx, sessionId)
   try {
-    // Stop/detach may append closing events; capture them while no writer can
-    // re-enter. The outer group lock keeps restore/remove off this copy.
-    if (await locateSessionDir(sessionId, paths.sessionsRoot) !== undefined) {
-      try {
-        await createBackupNow(ctx, sessionId, { ...paths, backupRoot: backups, beforeDelete: true })
-      } catch (error) {
-        throw internalError(sessionId, 'its final backup could not be saved; the session was not deleted', error)
-      }
-    }
-    // Older native remove APIs acquire their own deletion lock, so hand the
-    // write lease back immediately before entering that atomic native path.
-    if (typeof persistence?.remove === 'function' && typeof lease?.close === 'function') {
-      await lease.close()
-      lease = undefined
-    }
-    // Keep deletion intent outside the log, so an interrupted cleanup remains
-    // reviewable and retryable after the Session directory has disappeared.
+    await saveBackup()
+    // Keep intent outside the log before its removal. A failed schedule purge
+    // or removal leaves the session intact and cancels intent when proven live.
     if (cleanupOnDelete) await artifacts.markPending(sessionId)
+    if (cleanupAttachmentsOnDelete) {
+      const source = await locateSessionDir(sessionId, paths.sessionsRoot)
+      if (source === undefined) throw conflict('The session disappeared before its upload references could be recorded')
+      await new AttachmentCleanupStore(home, paths).capture(sessionId, source)
+    }
     try {
+      await purgeSchedule(ctx, sessionId)
+      // Native remove APIs acquire their own lease; release ours at this seam.
+      if (typeof persistence?.remove === 'function' && typeof lease?.close === 'function') {
+        await lease.close()
+        lease = undefined
+      }
       await removeStored(ctx, sessionId, paths)
     } catch (error) {
-      // A refused log deletion leaves a live Session; release its pending flag
-      // only when the log is positively present. Unknown state stays pending.
-      if (cleanupOnDelete && await persistence?.stat?.(sessionId).catch(() => undefined) != null) {
+      if (cleanupOnDelete && await sessionSnapshot(persistence, sessionId).catch(() => undefined) != null) {
         await artifacts.cancelPending(sessionId).catch(cause => ctx.logger?.warn?.(String(cause)))
       }
       throw error
@@ -1178,7 +1252,7 @@ async function runDelete(ctx, sessionId, stopActivity, explicitPaths, cleanupOnD
 async function assertDeletedSession(ctx, sessionId, paths) {
   const persistence = ctx.get('sessionPersistence')
   if (typeof persistence?.stat !== 'function') throw conflict('Session absence cannot be verified in this profile')
-  if (await persistence.stat(sessionId) != null || ctx.get('sessions')?.get?.(sessionId) != null
+  if (await sessionSnapshot(persistence, sessionId) != null || ctx.get('sessions')?.get?.(sessionId) != null
       || await locateSessionDir(sessionId, paths.sessionsRoot) !== undefined) {
     throw conflict('The session still exists; its temporary files were retained')
   }
@@ -1195,11 +1269,88 @@ async function cleanupDeletedArtifacts(ctx, sessionId, paths, artifacts) {
   }
 }
 
+// Cordis returns fresh use-site proxies; an own Symbol identifies the backend
+// across those views without confusing a provider replacement with a reload here.
+const ATTACHMENT_CORPUS_OWNER = Symbol.for('dsh-session-backup.attachment-corpus-owner.v1')
+function corpusOwner(service) {
+  if (service == null) return undefined
+  if (!Object.hasOwn(service, ATTACHMENT_CORPUS_OWNER)) {
+    Object.defineProperty(service, ATTACHMENT_CORPUS_OWNER, { value: {}, configurable: false })
+  }
+  return service[ATTACHMENT_CORPUS_OWNER]
+}
+
+/** Flush every loaded Session, then refuse changed providers, membership or seq. */
+async function prepareAttachmentLiveCheck(ctx, paths, guard) {
+  const sessions = ctx?.get?.('sessions')
+  const persistence = ctx?.get?.('sessionPersistence')
+  const root = persistence?.config?.root
+  const expected = paths.sessionsRoot ?? sessionsRoot(paths.home ?? dshHome())
+  if (typeof root !== 'string' || resolve(root) !== resolve(expected)
+      || typeof sessions?.list !== 'function' || typeof sessions.flush !== 'function') {
+    throw conflict('The complete local Session corpus cannot be verified; uploaded files were retained')
+  }
+  const sessionOwner = corpusOwner(sessions)
+  const persistenceOwner = corpusOwner(persistence)
+  const live = sessions.list()
+  if (!Array.isArray(live) || live.some(session => !Number.isSafeInteger(session?.seq))) {
+    throw conflict('Live Session membership cannot be verified; uploaded files were retained')
+  }
+  const versions = live.map(session => session.seq)
+  for (const session of live) {
+    if (await sessions.flush(session) === false) throw conflict('Live Session durability could not be verified; uploaded files were retained')
+  }
+  const check = () => {
+    const currentSessions = ctx?.get?.('sessions')
+    const currentPersistence = ctx?.get?.('sessionPersistence')
+    if (observeAttachmentUse(ctx, paths.home ?? dshHome()) !== guard
+        || corpusOwner(currentSessions) !== sessionOwner || corpusOwner(currentPersistence) !== persistenceOwner
+        || typeof currentPersistence?.config?.root !== 'string' || resolve(currentPersistence.config.root) !== resolve(expected)) {
+      throw conflict('Attachment or Session storage changed during cleanup; uploaded files were retained')
+    }
+    const current = currentSessions.list()
+    if (!Array.isArray(current) || current.length !== live.length
+        || current.some((session, index) => session !== live[index] || session.seq !== versions[index])) {
+      throw conflict('Live Sessions changed during attachment cleanup; retry when idle')
+    }
+  }
+  check()
+  return check
+}
+
+async function cleanupQueuedAttachments(ctx, sessionId, paths, guard) {
+  try {
+    const store = new AttachmentCleanupStore(paths.home ?? dshHome(), paths)
+    const observer = guard ?? observeAttachmentUse(ctx, paths.home ?? dshHome())
+    return await store.cleanup(sessionId, observer, () => prepareAttachmentLiveCheck(ctx, paths, observer))
+  } catch (error) {
+    ctx?.logger?.warn?.(`session-backup: upload cleanup for '${sessionId}' retained files: ${String(error)}`)
+    return { removed: 0, bytes: 0, retained: null, deferred: 0, failed: [{ id: sessionId, reason: String(error?.message ?? error) }] }
+  }
+}
+
+export async function retryAttachmentCleanup(ctx, paths, guard) {
+  const store = new AttachmentCleanupStore(paths.home ?? dshHome(), paths)
+  const failures = []
+  const pending = await store.pending({ onError: error => failures.push(error) })
+  const results = failures.map(({ sessionId, reason }) => ({
+    kind: 'attachments', sessionId, removed: 0, bytes: 0, retained: null, deferred: 0, failed: [{ id: sessionId, reason }],
+  }))
+  for (const { sessionId } of pending) results.push({
+    kind: 'attachments', sessionId, ...await cleanupQueuedAttachments(ctx, sessionId, paths, guard),
+  })
+  return results
+}
+
 /** Retry only marked inventories, serializing with backup restoration. */
 export async function retryArtifactCleanup(ctx, paths) {
   const artifacts = new SessionArtifactStore(paths.home ?? dshHome())
-  const results = []
-  for (const { sessionId } of await artifacts.pending()) {
+  const failures = []
+  const pending = await artifacts.pending({ onError: error => failures.push(error) })
+  const results = failures.map(({ sessionId, reason }) => ({
+    sessionId, removed: 0, bytes: 0, retained: null, failed: [{ id: sessionId, reason }],
+  }))
+  for (const { sessionId } of pending) {
     if (deleting.has(sessionId)) continue
     const group = resolve(paths.backupRoot ?? backupRoot(paths.home ?? dshHome()), sessionId)
     results.push(await withBackupGroup(group, async () => {
@@ -1271,7 +1422,7 @@ function route(ctx, handler) {
 }
 
 /**
- * Register the four API routes on the Host connection.
+ * Register the seven API routes on the Host connection.
  * @param ctx - Host context carrying the connection service.
  * @param config - `{ home }` override; defaults to `$DSH_HOME`.
  */
@@ -1287,6 +1438,13 @@ export function apply(ctx, rawConfig = {}) {
     storagesRoot: join(home, 'storages'),
   }
   const artifacts = new SessionArtifactStore(home)
+  const uploads = new AttachmentCleanupStore(home, paths)
+  let attachmentGuard
+  const observeUploads = () => { attachmentGuard = observeAttachmentUse(ctx, home) }
+  // Observe even while cleanup is off, so enabling the setting cannot lose
+  // staged receipts. Optional injection also handles a backend mounted later.
+  if (typeof ctx.inject === 'function') ctx.inject(['attachments', 'webServer'], observeUploads)
+  observeUploads()
   // Producers opt into ownership by allocating files through this service. It
   // accepts bytes, never a path to an existing file; cleanup stays Host-owned.
   if (typeof ctx.provide === 'function') ctx.provide('sessionArtifacts', {
@@ -1303,11 +1461,21 @@ export function apply(ctx, rawConfig = {}) {
       })
     },
   })
-  const settings = async () => ({
-    cleanupOnDelete: config.cleanupOnDelete,
-    editable: ctx.fiber?.entry !== undefined && typeof ctx.get('configEditor')?.edit === 'function',
-    pending: await artifacts.pending(),
-  })
+  const settings = async () => {
+    const pendingErrors = []
+    const pending = await artifacts.pending({ onError: error => pendingErrors.push(error) })
+    const attachmentPendingErrors = []
+    const attachmentPending = await uploads.pending({ onError: error => attachmentPendingErrors.push(error) })
+    return {
+      cleanupOnDelete: config.cleanupOnDelete,
+      cleanupAttachmentsOnDelete: config.cleanupAttachmentsOnDelete,
+      editable: ctx.fiber?.entry !== undefined && typeof ctx.get('configEditor')?.edit === 'function',
+      pending,
+      attachmentPending,
+      ...(pendingErrors.length === 0 ? {} : { pendingErrors }),
+      ...(attachmentPendingErrors.length === 0 ? {} : { attachmentPendingErrors }),
+    }
+  }
   const fetch = connectionOf(ctx).fetch
   ctx.effect(() => {
     const registered = [
@@ -1317,14 +1485,21 @@ export function apply(ctx, rawConfig = {}) {
         requestBody: 'buffered',
         fetch: route(ctx, async (request, body) => {
           if (request.method === 'GET') return { settings: await settings() }
-          if (typeof body?.cleanupOnDelete !== 'boolean') throw badRequest('cleanupOnDelete must be a boolean')
+          const changes = {}
+          for (const key of ['cleanupOnDelete', 'cleanupAttachmentsOnDelete']) {
+            if (body != null && Object.hasOwn(body, key)) {
+              if (typeof body[key] !== 'boolean') throw badRequest(`${key} must be a boolean`)
+              changes[key] = body[key]
+            }
+          }
+          if (Object.keys(changes).length === 0) throw badRequest('A cleanup setting must be provided')
           const editor = ctx.get('configEditor')
           const entry = ctx.fiber?.entry
           if (entry === undefined || typeof editor?.edit !== 'function') {
             throw conflict('Configuration cannot be saved in this profile')
           }
-          await editor.edit(entry, current => ({ ...current, cleanupOnDelete: body.cleanupOnDelete }))
-          return { settings: { ...await settings(), cleanupOnDelete: body.cleanupOnDelete } }
+          await editor.edit(entry, current => ({ ...current, ...changes }))
+          return { settings: { ...await settings(), ...changes } }
         }),
       }),
       fetch.register({
@@ -1332,8 +1507,12 @@ export function apply(ctx, rawConfig = {}) {
         methods: ['POST'],
         requestBody: 'buffered',
         fetch: route(ctx, async () => {
-          if (!config.cleanupOnDelete) throw conflict('Temporary-file cleanup is turned off')
-          return { results: await retryArtifactCleanup(ctx, paths), settings: await settings() }
+          if (!config.cleanupOnDelete && !config.cleanupAttachmentsOnDelete) throw conflict('File cleanup is turned off')
+          const results = [
+            ...(config.cleanupOnDelete ? await retryArtifactCleanup(ctx, paths) : []),
+            ...(config.cleanupAttachmentsOnDelete ? await retryAttachmentCleanup(ctx, paths, attachmentGuard) : []),
+          ]
+          return { results, settings: await settings() }
         }),
       }),
       fetch.register({
@@ -1369,7 +1548,9 @@ export function apply(ctx, rawConfig = {}) {
         methods: ['POST'],
         requestBody: 'buffered',
         fetch: route(ctx, async (request, body) => ({
-          removed: await removeBackup(assertRequestPath(body?.path), paths),
+          removed: await removeBackup(assertRequestPath(body?.path), {
+            ...paths, ctx, attachmentGuard, cleanupAttachmentsOnDelete: config.cleanupAttachmentsOnDelete,
+          }),
         })),
       }),
       fetch.register({
@@ -1380,6 +1561,8 @@ export function apply(ctx, rawConfig = {}) {
           deleted: await deleteSessionCascade(ctx, assertSessionId(body?.sessionId), {
             stopActivity: body?.stopActivity === true,
             cleanupOnDelete: config.cleanupOnDelete,
+            cleanupAttachmentsOnDelete: config.cleanupAttachmentsOnDelete,
+            attachmentGuard,
             paths,
           }),
         })),

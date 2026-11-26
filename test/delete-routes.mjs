@@ -205,7 +205,8 @@ async function runMode(kind) {
     assert.equal(await exists(home.spillDir), false, 'spill dir removed')
   }
   assert.ok(seen.includes('activity.ask'), 'activity gate asked')
-  assert.ok(seen.includes('session.stop'), 'session-stop fired (schedule purge layer 1)')
+  assert.ok(!seen.includes('session.stop'), 'idle deletion does not stop providers before the final backup')
+  assert.ok(seen.includes(kind === 'alpha3' ? 'schedule.deleteSessionTasks' : 'schedule.delete'), 'scheduled rows are purged before log removal')
   assert.ok(seen.includes('emit.removed'), 'removed event emitted')
   assert.ok(seen.indexOf('activity.ask') < seen.indexOf('emit.removed'), 'gate before emit')
   assert.ok(seen.includes(kind === 'alpha3' ? 'persistence.remove' : 'schedule.delete'), 'version-native removal')

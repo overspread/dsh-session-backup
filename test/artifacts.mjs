@@ -1,6 +1,7 @@
 /** Real filesystem coverage; no Harness, live sessions, network, or dependencies. */
 import assert from 'node:assert/strict'
-import { appendFile, chmod, copyFile, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
+import fsPromises, { appendFile, chmod, copyFile, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
+import { syncBuiltinESMExports } from 'node:module'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { tmpdir } from 'node:os'
 import test from 'node:test'
@@ -21,6 +22,26 @@ async function fixture(run) {
     assert.ok(rel.startsWith('dsh-session-artifacts-test-') && !rel.includes(sep) && !isAbsolute(rel))
     assert.equal((await lstat(target)).isSymbolicLink(), false)
     await rm(target, { recursive: true, force: true })
+  }
+}
+
+/** Inject fsync failure only for matched fixture paths; restore built-ins before fixture cleanup. */
+async function withSyncFailure(matches, run) {
+  const originalOpen = fsPromises.open
+  let failures = 0
+  fsPromises.open = async (path, ...args) => {
+    const handle = await originalOpen(path, ...args)
+    if (matches(path)) handle.sync = async () => {
+      failures += 1
+      throw Object.assign(new Error('Injected artifact fsync failure'), { code: 'EIO' })
+    }
+    return handle
+  }
+  syncBuiltinESMExports()
+  try { return await run(() => failures) }
+  finally {
+    fsPromises.open = originalOpen
+    syncBuiltinESMExports()
   }
 }
 
@@ -161,6 +182,7 @@ test('all managed ancestor symlinks and an explicit symlink home are rejected', 
   const alias = join(home, 'alias')
   await symlink(target, alias)
   await assert.rejects(new SessionArtifactStore(alias).save('session-a', 'x', 'x'), { code: 'ARTIFACTS_UNSAFE' })
+  await assert.rejects(new SessionArtifactStore(alias).pending(), { code: 'ARTIFACTS_UNSAFE' })
   for (const part of ['session-artifacts', 'objects', 'registry']) {
     const ownHome = join(home, `case-${part}`)
     await mkdir(ownHome, { mode: 0o700 })
@@ -169,6 +191,7 @@ test('all managed ancestor symlinks and an explicit symlink home are rejected', 
     const symlinkPath = part === 'session-artifacts' ? root : join(root, part)
     await symlink(target, symlinkPath)
     await assert.rejects(new SessionArtifactStore(ownHome).save('session-a', 'x', 'x'), { code: 'ARTIFACTS_UNSAFE' })
+    await assert.rejects(new SessionArtifactStore(ownHome).pending({ onError: () => assert.fail('Unsafe layouts must reject the whole scan') }), { code: 'ARTIFACTS_UNSAFE' })
     assert.deepEqual(await readdir(target), [])
   }
 }))
@@ -228,6 +251,112 @@ test('pending zero-entry crash intent is visible and can be finalized', () => fi
   assert.deepEqual(await new SessionArtifactStore(home).pending(), [{ sessionId: 'session-a', count: 0 }])
   assert.deepEqual(await store.cleanup('session-a'), blank)
   assert.equal(await exists(path), false)
+}))
+
+test('pending isolates malformed JSON, invalid schema, and unsafe entries while reporting each retained ledger', () => fixture(async ({ home, store }) => {
+  const broken = [
+    { sessionId: 'session-a-json', alter: () => '{broken-json' },
+    { sessionId: 'session-c-schema', alter: ledger => JSON.stringify({ ...ledger, version: 99 }) },
+    { sessionId: 'session-e-entry', alter: ledger => {
+      ledger.entries[0].name = '../../workspace.png'
+      return JSON.stringify(ledger)
+    } },
+  ]
+  for (const item of broken) {
+    item.artifact = await store.save(item.sessionId, 'retained.png', `owned ${item.sessionId}`)
+    await store.markPending(item.sessionId)
+    const path = ledgerPath(home, item.sessionId)
+    item.contents = item.alter(JSON.parse(await readFile(path, 'utf8')))
+    await writeFile(path, item.contents)
+  }
+  const healthy = []
+  for (const sessionId of ['session-b-healthy', 'session-d-healthy']) {
+    healthy.push(await store.save(sessionId, 'healthy.png', 'healthy'))
+    await store.markPending(sessionId)
+  }
+  const unregistered = join(dirname(healthy[0].path), 'unregistered.png')
+  const workspace = join(home, 'workspace.png')
+  await writeFile(unregistered, 'unregistered user file')
+  await writeFile(workspace, 'workspace user file')
+  const issues = []
+  const expected = healthy.map(({ sessionId }) => ({ sessionId, count: 1 }))
+  assert.deepEqual(await store.pending({ onError: issue => issues.push(issue) }), expected)
+  assert.deepEqual(issues.map(issue => issue.sessionId), broken.map(item => item.sessionId))
+  assert.ok(issues.every(issue => typeof issue.code === 'string' && typeof issue.reason === 'string' && issue.reason.length > 0))
+  assert.deepEqual(await new SessionArtifactStore(home).pending(), expected, 'legacy callers still receive only healthy pending rows')
+  await assert.rejects(store.pending({ onError: true }), { code: 'ARTIFACTS_INVALID' })
+  for (const artifact of healthy) {
+    assert.equal((await store.cleanup(artifact.sessionId)).removed, 1)
+    assert.equal(await exists(artifact.path), false)
+  }
+  for (const item of broken) {
+    assert.equal(await readFile(ledgerPath(home, item.sessionId), 'utf8'), item.contents)
+    await assert.rejects(store.cleanup(item.sessionId), 'direct cleanup still refuses the unreadable ledger')
+    assert.equal(await readFile(item.artifact.path, 'utf8'), `owned ${item.sessionId}`)
+  }
+  assert.equal(await readFile(unregistered, 'utf8'), 'unregistered user file')
+  assert.equal(await readFile(workspace, 'utf8'), 'workspace user file')
+}))
+
+test('pending reports a symlinked ledger without following or deleting it and still discovers healthy sessions', () => fixture(async ({ home, store }) => {
+  const retained = await store.save('session-a-linked', 'retained.png', 'retained')
+  const healthy = await store.save('session-b-healthy', 'healthy.png', 'healthy')
+  await store.markPending(retained.sessionId)
+  await store.markPending(healthy.sessionId)
+  const path = ledgerPath(home, retained.sessionId)
+  const foreign = join(home, 'foreign-ledger.json')
+  await rename(path, foreign)
+  const original = await readFile(foreign, 'utf8')
+  await symlink(foreign, path)
+  const issues = []
+  assert.deepEqual(await store.pending({ onError: issue => issues.push(issue) }), [{ sessionId: healthy.sessionId, count: 1 }])
+  assert.deepEqual(issues, [{ sessionId: retained.sessionId, code: 'ARTIFACTS_UNSAFE', reason: 'Registered file is not a regular file' }])
+  assert.equal((await lstat(path)).isSymbolicLink(), true)
+  assert.equal(await readFile(foreign, 'utf8'), original)
+  assert.equal(await readFile(retained.path, 'utf8'), 'retained')
+  assert.equal((await store.cleanup(healthy.sessionId)).removed, 1)
+  assert.equal(await exists(healthy.path), false)
+  assert.equal(await readFile(foreign, 'utf8'), original)
+}))
+
+test('save fsync failure before ledger publication keeps the previous ledger and rolls back only its new object', () => fixture(async ({ home, store }) => {
+  const existing = await store.save('session-a', 'existing.png', 'existing')
+  const path = ledgerPath(home, existing.sessionId)
+  const original = await readFile(path, 'utf8')
+  const registry = dirname(path)
+  await withSyncFailure(candidate => dirname(candidate) === registry && basename(candidate).endsWith('.tmp'), async failures => {
+    await assert.rejects(store.save(existing.sessionId, 'not-published.png', 'not published'), { code: 'EIO' })
+    assert.equal(failures(), 1, 'the staged ledger file fsync failed before rename')
+  })
+  assert.equal(await readFile(path, 'utf8'), original)
+  assert.deepEqual(await readdir(dirname(existing.path)), [basename(existing.path)])
+  assert.equal(await readFile(existing.path, 'utf8'), 'existing')
+  assert.equal((await new SessionArtifactStore(home).cleanup(existing.sessionId)).removed, 1)
+}))
+
+test('save preserves registered objects when registry fsync fails after ledger rename', { skip: process.platform === 'win32' }, () => fixture(async ({ home, store }) => {
+  const existing = await store.save('session-a', 'existing.png', 'existing')
+  const registry = dirname(ledgerPath(home, existing.sessionId))
+  const unregistered = join(dirname(existing.path), 'unregistered.png')
+  await writeFile(unregistered, 'user file')
+  await withSyncFailure(candidate => candidate === registry, async failures => {
+    await assert.rejects(store.save(existing.sessionId, 'published.png', 'published'), { code: 'EIO' })
+    assert.equal(failures(), 1, 'the registry directory fsync failed after rename')
+  })
+  const ledger = JSON.parse(await readFile(ledgerPath(home, existing.sessionId), 'utf8'))
+  assert.equal(ledger.pending, false)
+  assert.equal(ledger.entries.length, 2, 'the published ledger owns both the previous and new object')
+  for (const entry of ledger.entries) {
+    const path = join(home, 'session-artifacts', 'objects', existing.sessionId, `${entry.id}-${entry.name}`)
+    assert.equal(await readFile(path, 'utf8'), entry.name === 'existing.png' ? 'existing' : 'published')
+  }
+  const restarted = new SessionArtifactStore(home)
+  assert.equal(await restarted.has(existing.sessionId), true)
+  await restarted.markPending(existing.sessionId)
+  assert.deepEqual(await restarted.pending(), [{ sessionId: existing.sessionId, count: 2 }])
+  assert.deepEqual(await restarted.cleanup(existing.sessionId), { removed: 2, bytes: 17, retained: 0, failed: [] })
+  assert.equal(await readFile(unregistered, 'utf8'), 'user file')
+  assert.equal(await exists(ledgerPath(home, existing.sessionId)), false)
 }))
 
 test('concurrent stores serialize saves and cleanup without losing ownership or crossing sessions', () => fixture(async ({ home, store }) => {

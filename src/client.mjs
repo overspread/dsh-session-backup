@@ -54,22 +54,32 @@ const zh = {
   'footer.select': '多选',
   'footer.exit': '退出多选',
   'footer.backups': '备份',
-  'footer.cleanup': '临时文件',
-  'cleanup.title': '会话临时文件',
-  'cleanup.description': '删除会话时，可一并清理通过临时产物登记功能生成的截图和文件。工作区文件、共享附件和历史未登记文件会保留。临时文件不包含在会话备份中，清理后无法恢复。',
+  'footer.cleanup': '文件清理',
+  'cleanup.title': '会话文件清理',
+  'cleanup.description': '临时文件开关仅清理通过临时产物登记功能生成的截图和文件，工作区文件不受影响。临时文件不包含在会话备份中，清理后无法恢复。',
   'cleanup.enabled': '删除会话时清理已登记临时文件',
+  'cleanup.attachmentsEnabled': '删除会话时回收上传的图片和文件副本',
+  'cleanup.attachmentsDescription': '仅回收已登记候选中的上传副本，原件不受影响，不扫描历史孤儿文件。备份或其他会话仍有引用时保留，最后引用删除后可回收。本次 Host 运行使用过的副本会保护到 Host 重启，即使已不再使用也会保留；重启后可重试回收。',
   'cleanup.loading': '正在读取设置…',
   'cleanup.saving': '正在保存…',
-  'cleanup.default': '默认关闭，设置保存后对单个和批量删除均生效。',
-  'cleanup.readOnly': '当前配置无法在此保存，请在插件配置中设置 cleanupOnDelete。',
+  'cleanup.default': '两个开关默认关闭、独立保存，对单个和批量删除均生效。',
+  'cleanup.readOnly': '当前配置无法在此保存，请在插件配置中分别设置 cleanupOnDelete 和 cleanupAttachmentsOnDelete。',
   'cleanup.pending': '有 {count} 个会话的临时文件等待清理重试。',
+  'cleanup.pendingErrors': '有 {count} 个临时文件清理账本无法读取：',
+  'cleanup.attachmentPending': '有 {count} 个会话的上传文件副本等待回收重试。',
+  'cleanup.attachmentPendingErrors': '有 {count} 个上传文件候选清单无法读取：',
+  'cleanup.pendingError': '{sessionId}：{reason}',
   'cleanup.retry': '重试待清理文件',
   'cleanup.saved': '已保存',
-  'cleanup.done': '已清理 {count} 个临时文件。',
-  'cleanup.partial': '部分临时文件保留，可稍后重试：{message}',
-  'status.deletedCleanupPending': '会话已删除；部分临时文件保留，可在「临时文件」中查看并重试。',
-  'status.deletedOneCleaned': '已删除「{title}」，清理了 {count} 个临时文件',
-  'status.deletedManyCleaned': '已删除 {count} 个会话，清理了 {files} 个临时文件',
+  'cleanup.done': '已清理 {count} 个文件。',
+  'cleanup.partial': '警告：部分文件清理失败，可稍后重试：{message}',
+  'status.deletedCleanupPending': '会话已删除；部分文件清理失败，可在「文件清理」中查看并重试。',
+  'status.deletedOneCleaned': '已删除「{title}」，清理了 {count} 个文件',
+  'status.deletedManyCleaned': '已删除 {count} 个会话，清理了 {files} 个文件',
+  'status.attachmentsCleaned': '已回收 {count} 个上传文件副本（{bytes}）。',
+  'status.attachmentsRetained': '已保留 {count} 个上传文件副本：备份或其他会话仍有引用，或受本次 Host 运行保护。最后引用删除后可回收；本次运行使用过的副本须在 Host 重启后重试。原件不受影响。',
+  'status.attachmentsDeferred': '其中 {count} 个上传文件副本因本次 Host 运行使用过而受到保护，须在 Host 重启后重试回收；这不是清理错误。',
+  'status.attachmentsFailed': '警告：{count} 个上传文件副本回收失败：{message}',
   'footer.count': '已选 {count} 个',
   'footer.backupSelected': '备份选中',
   'footer.deleteSelected': '删除选中',
@@ -79,7 +89,7 @@ const zh = {
   'menu.deselect': '移出选择',
   'menu.backup': '立即备份',
   'dialog.delete.title': '删除选中的会话？',
-  'dialog.delete.description': '将删除选中的 {count} 个会话，正在运行的会话会跳过。删除前会保存最新内容，更新已有备份而不新增副本；之后可在「备份」里恢复。临时文件清理按「临时文件」设置执行。',
+  'dialog.delete.description': '将删除选中的 {count} 个会话，正在运行的会话会跳过。删除前会保存最新内容，更新已有备份而不新增副本；之后可在「备份」里恢复。文件清理按「文件清理」中的两个独立开关执行。',
   'dialog.delete.confirm': '删除',
   'dialog.delete.cancel': '取消',
   'dialog.backups.title': '会话备份',
@@ -102,20 +112,25 @@ const zh = {
   'status.deleted': '已删除 {count} 个会话',
   'status.deletedWithSkipped': '已删除 {deleted} 个会话，{active} 个正在运行的已跳过',
   'status.activeSkipped': '{count} 个会话正在运行，未删除',
+  'status.batchDeleteProgress': '已删除 {deleted} 个；{active} 个运行中的会话已跳过；{pending} 个会话待清理；已清理 {files} 个文件。',
+  'status.deleteWarning': '会话已删除，但部分缓存或临时文件未清理；可重试删除：{message}',
+  'status.restoreRefreshFailed': '会话已恢复，但备份列表刷新失败：{message}',
   'status.restored': '已恢复「{title}」，它已重新出现在工作区列表里',
   'status.restoredDone': '已恢复「{title}」，它已重新出现在工作区列表里，本次备份已删除',
   'status.restoredUngrouped': '已恢复「{title}」，它显示在侧栏「未分组」分组下',
   'status.restoredUngroupedDone': '已恢复「{title}」，它显示在侧栏「未分组」分组下，本次备份已删除',
   'status.restoredDetached': '已恢复「{title}」的文件，但没能把它重新挂回工作区：{reason}',
   'status.backupRemoved': '已删除该备份',
+  'status.backupRemoveRefreshFailed': '备份已删除，但备份列表刷新失败：{message}',
   'error.requestFailed': '请求失败：{message}',
   'error.restoreExists': '无法恢复：该会话已经在列表里了（可能已恢复过，或删除没有完成）。需要的话请先彻底删除它，再恢复这份备份。',
+  'error.restoreDeleting': '该会话正在删除，请等待删除完成后再恢复备份。',
   'error.deleteFailed': '删除失败：{message}',
   'error.backupBlockedDelete': '备份失败，已取消删除：{message}',
   'menu.deleteOne': '彻底删除…',
   'deleteOne.title': '彻底删除此会话？',
   'deleteOne.stopTitle': '停止并彻底删除此会话？',
-  'deleteOne.desc': '将删除“{title}”的会话日志与相关缓存数据。删除前会保存最新内容，更新已有备份而不新增副本；之后可在「备份」里恢复。临时文件清理按「临时文件」设置执行。工作区文件夹中的文件不受影响。',
+  'deleteOne.desc': '将删除“{title}”的会话日志与相关缓存数据。删除前会保存最新内容，更新已有备份而不新增副本；之后可在「备份」里恢复。文件清理按「文件清理」中的两个独立开关执行。工作区文件夹中的文件不受影响。',
   'deleteOne.activity': '删除前将停止的工作',
   'deleteOne.action': '删除',
   'deleteOne.stopAction': '停止并删除',
@@ -128,22 +143,32 @@ const en = {
   'footer.select': 'Select',
   'footer.exit': 'Exit select',
   'footer.backups': 'Backups',
-  'footer.cleanup': 'Temporary files',
-  'cleanup.title': 'Session temporary files',
-  'cleanup.description': 'When deleting a session, you can also clean up screenshots and files created through the temporary artifact registry. Workspace files, shared attachments, and older unregistered files are retained. Temporary files are not included in session backups and cannot be restored after cleanup.',
+  'footer.cleanup': 'File cleanup',
+  'cleanup.title': 'Session file cleanup',
+  'cleanup.description': 'The temporary-file setting only cleans up screenshots and files recorded by the temporary artifact registry. Workspace files are unaffected. Temporary files are not included in session backups and cannot be restored after cleanup.',
   'cleanup.enabled': 'Clean up registered temporary files when deleting sessions',
+  'cleanup.attachmentsEnabled': 'Reclaim uploaded image and file copies when deleting sessions',
+  'cleanup.attachmentsDescription': 'Only registered upload candidates are reclaimed; originals are unaffected and historical orphan files are not scanned. Copies referenced by backups or other sessions are retained until their last reference is deleted. Copies used during this Host run remain protected until the Host restarts, even after use ends; retry reclamation after restarting the Host.',
   'cleanup.loading': 'Loading settings…',
   'cleanup.saving': 'Saving…',
-  'cleanup.default': 'Off by default. Saved settings apply to both individual and batch deletion.',
-  'cleanup.readOnly': 'This profile cannot save configuration here. Set cleanupOnDelete in the plugin configuration.',
+  'cleanup.default': 'Both settings are off by default and saved independently. They apply to individual and batch deletion.',
+  'cleanup.readOnly': 'This profile cannot save configuration here. Set cleanupOnDelete and cleanupAttachmentsOnDelete separately in the plugin configuration.',
   'cleanup.pending': '{count} sessions have temporary files awaiting a cleanup retry.',
+  'cleanup.pendingErrors': '{count} temporary-file cleanup ledgers could not be read:',
+  'cleanup.attachmentPending': '{count} sessions have uploaded file copies awaiting a cleanup retry.',
+  'cleanup.attachmentPendingErrors': '{count} upload candidate inventories could not be read:',
+  'cleanup.pendingError': '{sessionId}: {reason}',
   'cleanup.retry': 'Retry pending cleanup',
   'cleanup.saved': 'Saved',
-  'cleanup.done': 'Cleaned up {count} temporary files.',
-  'cleanup.partial': 'Some temporary files were retained. You can retry later: {message}',
-  'status.deletedCleanupPending': 'Sessions deleted; some temporary files were retained. Review and retry under “Temporary files”.',
-  'status.deletedOneCleaned': 'Deleted “{title}” and cleaned up {count} temporary files',
-  'status.deletedManyCleaned': 'Deleted {count} sessions and cleaned up {files} temporary files',
+  'cleanup.done': 'Cleaned up {count} files.',
+  'cleanup.partial': 'Warning: some files could not be cleaned up. You can retry later: {message}',
+  'status.deletedCleanupPending': 'Sessions deleted; some file cleanup failed. Review and retry under “File cleanup”.',
+  'status.deletedOneCleaned': 'Deleted “{title}” and cleaned up {count} files',
+  'status.deletedManyCleaned': 'Deleted {count} sessions and cleaned up {files} files',
+  'status.attachmentsCleaned': 'Reclaimed {count} uploaded file copies ({bytes}).',
+  'status.attachmentsRetained': '{count} uploaded file copies are retained because backups or other sessions still reference them, or this Host run protects them. Reclamation requires deleting the last reference; copies used during this run also require a Host restart before retrying. Originals are unaffected.',
+  'status.attachmentsDeferred': 'Of these, {count} uploaded file copies are protected because they were used during this Host run. Retry reclamation after the Host restarts; this is not a cleanup error.',
+  'status.attachmentsFailed': 'Warning: {count} uploaded file copies could not be reclaimed: {message}',
   'footer.count': '{count} selected',
   'footer.backupSelected': 'Back up selected',
   'footer.deleteSelected': 'Delete selected',
@@ -153,7 +178,7 @@ const en = {
   'menu.deselect': 'Remove from selection',
   'menu.backup': 'Back up now',
   'dialog.delete.title': 'Delete the selected sessions?',
-  'dialog.delete.description': 'Delete the {count} selected sessions, skipping any still running. Their latest contents are saved first, updating existing backups without adding another copy. Restore them from “Backups”. Temporary-file cleanup follows the “Temporary files” setting.',
+  'dialog.delete.description': 'Delete the {count} selected sessions, skipping any still running. Their latest contents are saved first, updating existing backups without adding another copy. Restore them from “Backups”. File cleanup follows the two independent settings under “File cleanup”.',
   'dialog.delete.confirm': 'Delete',
   'dialog.delete.cancel': 'Cancel',
   'dialog.backups.title': 'Session backups',
@@ -176,20 +201,25 @@ const en = {
   'status.deleted': 'Deleted {count} sessions',
   'status.deletedWithSkipped': 'Deleted {deleted} sessions; skipped {active} still running',
   'status.activeSkipped': '{count} sessions are running and were not deleted',
+  'status.batchDeleteProgress': 'Deleted {deleted}; skipped {active} running sessions; {pending} sessions need cleanup; cleaned {files} files.',
+  'status.deleteWarning': 'The session was deleted, but some caches or temporary files were not cleaned up. Retry deletion: {message}',
+  'status.restoreRefreshFailed': 'The session was restored, but refreshing the backup list failed: {message}',
   'status.restored': 'Restored “{title}”; it is listed under its workspace again',
   'status.restoredDone': 'Restored “{title}”; it is listed under its workspace again, and this backup was removed',
   'status.restoredUngrouped': 'Restored “{title}”; it appears under “Ungrouped” in the sidebar',
   'status.restoredUngroupedDone': 'Restored “{title}”; it appears under “Ungrouped” in the sidebar, and this backup was removed',
   'status.restoredDetached': 'Restored the files for “{title}”, but could not re-attach it to a workspace: {reason}',
   'status.backupRemoved': 'Backup deleted',
+  'status.backupRemoveRefreshFailed': 'The backup was deleted, but refreshing the backup list failed: {message}',
   'error.requestFailed': 'Request failed: {message}',
   'error.restoreExists': 'Cannot restore: that session already exists in the list (it may already be restored, or the delete never completed). Delete it first if you want to restore this backup.',
+  'error.restoreDeleting': 'This session is being deleted. Wait for deletion to finish, then retry restoring the backup.',
   'error.deleteFailed': 'Delete failed: {message}',
   'error.backupBlockedDelete': 'Backup failed; the delete was cancelled: {message}',
   'menu.deleteOne': 'Delete session…',
   'deleteOne.title': 'Permanently delete this session?',
   'deleteOne.stopTitle': 'Stop and delete this session?',
-  'deleteOne.desc': 'This deletes the session log and related cached data for “{title}” after saving the latest contents. An existing backup is updated without adding another copy; restore it from “Backups”. Temporary-file cleanup follows the “Temporary files” setting. Files in the workspace folder are unaffected.',
+  'deleteOne.desc': 'This deletes the session log and related cached data for “{title}” after saving the latest contents. An existing backup is updated without adding another copy; restore it from “Backups”. File cleanup follows the two independent settings under “File cleanup”. Files in the workspace folder are unaffected.',
   'deleteOne.activity': 'Work that will be stopped before deletion',
   'deleteOne.action': 'Delete',
   'deleteOne.stopAction': 'Stop and delete',
@@ -220,6 +250,7 @@ const CSS = `
 .dshsb-activity { margin: 8px 0 0; padding-left: 18px; font-size: 12px; opacity: .85; }
 .dshsb-cleanup-setting { display: flex; align-items: flex-start; gap: 8px; }
 .dshsb-cleanup-setting input { flex: none; margin-top: 3px; accent-color: var(--dsw-alias-accent-primary); }
+.dshsb-cleanup-errors { margin: 4px 0 0; padding-left: 18px; overflow-wrap: anywhere; }
 `
 
 /**
@@ -286,6 +317,7 @@ function createStore() {
     toggleId,
     toggleFromMenu: (id) => set({ selecting: true, ids: state.ids.includes(id) ? state.ids.filter((value) => value !== id) : [...state.ids, id] }),
     clearSelection: () => set({ ids: [] }),
+    removeIds: (ids) => set({ ids: state.ids.filter((id) => !ids.includes(id)) }),
     openDialog: (dialog) => set({ dialog, removePending: null }),
     closeDialog: () => set({ dialog: null, removePending: null }),
     /** Open the single-session danger confirm; `activity: []` = idle variant. */
@@ -418,6 +450,46 @@ function leaveIfCurrent(id) {
   }
 }
 
+/** Normalize older Hosts without borrowing the temporary-file permission. */
+function cleanupSettingsOf(settings) {
+  if (typeof settings?.cleanupOnDelete !== 'boolean'
+    || (settings.cleanupAttachmentsOnDelete !== undefined && typeof settings.cleanupAttachmentsOnDelete !== 'boolean')) {
+    throw new Error('Invalid cleanup settings response')
+  }
+  return {
+    ...settings,
+    cleanupAttachmentsOnDelete: settings.cleanupAttachmentsOnDelete === true,
+    attachmentPending: Array.isArray(settings.attachmentPending) ? settings.attachmentPending : [],
+  }
+}
+
+/** Temporary artifacts and attachment rows share these result fields. */
+function cleanupSummary(results) {
+  return results.reduce((summary, result) => ({
+    removed: summary.removed + (result?.removed ?? 0),
+    bytes: summary.bytes + (result?.bytes ?? 0),
+    retained: summary.retained + (result?.retained ?? 0),
+    deferred: summary.deferred + (result?.deferred ?? 0),
+    failed: [...summary.failed, ...(Array.isArray(result?.failed) ? result.failed : [])],
+  }), { removed: 0, bytes: 0, retained: 0, deferred: 0, failed: [] })
+}
+
+/** Retention is normal; only failed candidates receive a warning. */
+function attachmentCleanupDetails(results) {
+  const present = results.filter(result => result != null)
+  if (present.length === 0) return []
+  const summary = cleanupSummary(present)
+  return [
+    { key: 'status.attachmentsCleaned', params: { count: summary.removed, bytes: formatBytes(summary.bytes) } },
+    ...(summary.retained > 0 ? [{ key: 'status.attachmentsRetained', params: { count: summary.retained } }] : []),
+    ...(summary.deferred > 0 ? [{ key: 'status.attachmentsDeferred', params: { count: summary.deferred } }] : []),
+    ...(summary.failed.length > 0 ? [{ key: 'status.attachmentsFailed', params: {
+      count: summary.failed.length,
+      message: summary.failed.map(failure => failure?.reason ?? failure?.code ?? failure?.id ?? 'Unknown error').join('; '),
+    } }] : []),
+  ]
+}
+
 // ---------------------------------------------------------------------------
 // Batch actions
 // ---------------------------------------------------------------------------
@@ -432,6 +504,14 @@ function createActions(ctx) {
     })
     return payload?.deleted ?? { deleted: true }
   }
+
+  const deletionWarnings = (result) => [
+    ...(Array.isArray(result?.cleanup?.failed) ? result.cleanup.failed.map((failure) => failure?.reason) : []),
+    ...(Array.isArray(result?.warnings) ? result.warnings : []),
+  ].map((warning) => String(warning ?? '').trim()).filter(Boolean)
+  const warningDetails = (warnings) => warnings.length > 0
+    ? [{ key: 'status.deleteWarning', params: { message: warnings.join('; ') } }]
+    : []
 
   const backupOne = async (sessionId) => {
     try {
@@ -472,45 +552,74 @@ function createActions(ctx) {
     let deleted = 0
     let active = 0
     let files = 0
-    let cleanupPending = false
+    let pending = 0
+    const warnings = []
+    const attachments = []
     for (const sessionId of sessionIds) {
       try {
         const result = await deleteOne(sessionId)
-        files += result.cleanup?.removed ?? 0
-        cleanupPending ||= (result.cleanup?.failed?.length ?? 0) > 0
+        files += (result.cleanup?.removed ?? 0) + (result.attachments?.removed ?? 0)
+        if ((result.cleanup?.failed?.length ?? 0) > 0 || (result.attachments?.failed?.length ?? 0) > 0) pending += 1
+        warnings.push(...deletionWarnings(result))
+        if (result.attachments) attachments.push(result.attachments)
       } catch (error) {
         if (error?.cause?.code === 'workspace/session-active' || error?.code === 'workspace/session-active') {
           active += 1
           continue
         }
-        store.fail({ key: 'error.deleteFailed', params: { message: messageOf(error) } })
+        const details = [
+          ...(deleted > 0 || active > 0 || pending > 0
+            ? [{ key: 'status.batchDeleteProgress', params: { deleted, active, pending, files } }]
+            : []),
+          ...warningDetails(warnings),
+          ...attachmentCleanupDetails(attachments),
+        ]
+        store.fail({
+          key: 'error.deleteFailed',
+          params: { message: messageOf(error) },
+          ...(details.length > 0 ? { details } : {}),
+        })
         return
       }
       refreshList()
       leaveIfCurrent(sessionId)
       deleted += 1
+      store.removeIds([sessionId])
     }
-    store.clearSelection()
-    if (cleanupPending) {
-      store.setStatus({ key: 'status.deletedCleanupPending' })
+    const details = [
+      ...(active > 0 || pending > 0
+        ? [{ key: 'status.batchDeleteProgress', params: { deleted, active, pending, files } }]
+        : []),
+      ...warningDetails(warnings),
+      ...attachmentCleanupDetails(attachments),
+    ]
+    if (pending > 0) {
+      store.setStatus({ key: 'status.deletedCleanupPending', ...(details.length > 0 ? { details } : {}) })
     } else if (active > 0) {
       store.setStatus({
         key: deleted > 0 ? 'status.deletedWithSkipped' : 'status.activeSkipped',
         params: { deleted, active, count: active },
+        ...(details.length > 0 ? { details } : {}),
       })
     } else {
-      store.setStatus({ key: files > 0 ? 'status.deletedManyCleaned' : 'status.deleted', params: { count: deleted, files } })
+      store.setStatus({
+        key: files > 0 ? 'status.deletedManyCleaned' : 'status.deleted',
+        params: { count: deleted, files },
+        ...(details.length > 0 ? { details } : {}),
+      })
     }
   }
 
-  const refreshBackups = async () => {
+  const refreshBackups = async ({ silent = false } = {}) => {
     store.set({ backupsLoading: true })
     try {
       const payload = await call('list')
       store.set({ backups: Array.isArray(payload?.backups) ? payload.backups : [], backupsLoading: false })
+      return null
     } catch (error) {
       store.set({ backupsLoading: false })
-      store.fail({ key: 'error.requestFailed', params: { message: messageOf(error) } })
+      if (!silent) store.fail({ key: 'error.requestFailed', params: { message: messageOf(error) } })
+      return error
     }
   }
 
@@ -530,26 +639,49 @@ function createActions(ctx) {
           : restored.attached === false
             ? 'status.restoredDetached'
             : consumed ? 'status.restoredDone' : 'status.restored'
-      store.setStatus({ key, params: { title, reason: restored.reason ?? '' } })
+      const status = { key, params: { title, reason: restored.reason ?? '' } }
+      const details = restored.cleanupWarning ? [String(restored.cleanupWarning)] : []
+      store.setStatus({ ...status, ...(details.length > 0 ? { details } : {}) })
       // The Host event feed only announces removals; a restore has no event,
       // so push the sidebar list refresh here or the row appears only after
       // the user reloads the page.
       refreshList()
-      await refreshBackups()
+      const refreshError = await refreshBackups({ silent: true })
+      if (refreshError) {
+        store.setStatus({
+          ...status,
+          details: [...details, { key: 'status.restoreRefreshFailed', params: { message: messageOf(refreshError) } }],
+        })
+      }
     } catch (error) {
       // The raw kernel sentence ("session … already exists at …") reads like a
       // failure; this is the expected "already restored / not deleted" state.
-      store.fail(error?.code === 'session-backup/conflict'
-        ? { key: 'error.restoreExists', params: {} }
-        : { key: 'error.requestFailed', params: { message: messageOf(error) } })
+      store.fail(error?.code === 'session-backup/deleting'
+        ? { key: 'error.restoreDeleting', params: {} }
+        : error?.code === 'session-backup/conflict'
+          ? { key: 'error.restoreExists', params: {} }
+          : { key: 'error.requestFailed', params: { message: messageOf(error) } })
     }
   }
 
   const removeOne = async (backup) => {
     try {
-      await call('remove', { path: backup.path })
-      store.setStatus({ key: 'status.backupRemoved', params: {} })
-      await refreshBackups()
+      const payload = await call('remove', { path: backup.path })
+      const details = attachmentCleanupDetails([payload?.removed?.attachments])
+      const status = { key: 'status.backupRemoved', params: {} }
+      const backups = store.getSnapshot().backups
+      store.set({
+        removePending: null,
+        ...(Array.isArray(backups) ? { backups: backups.filter(item => item.path !== backup.path) } : {}),
+      })
+      store.setStatus({ ...status, ...(details.length > 0 ? { details } : {}) })
+      const refreshError = await refreshBackups({ silent: true })
+      if (refreshError) {
+        store.setStatus({
+          ...status,
+          details: [...details, { key: 'status.backupRemoveRefreshFailed', params: { message: messageOf(refreshError) } }],
+        })
+      }
     } catch (error) {
       store.fail({ key: 'error.requestFailed', params: { message: messageOf(error) } })
     }
@@ -559,19 +691,18 @@ function createActions(ctx) {
     store.set({ cleanupLoading: true, cleanupError: null, cleanupStatus: null })
     try {
       const payload = await call('cleanup-settings')
-      if (typeof payload?.settings?.cleanupOnDelete !== 'boolean') throw new Error('Invalid cleanup settings response')
-      store.set({ cleanupSettings: payload.settings, cleanupLoading: false })
+      store.set({ cleanupSettings: cleanupSettingsOf(payload?.settings), cleanupLoading: false })
     } catch (error) {
       store.set({ cleanupLoading: false, cleanupSettings: null, cleanupError: messageOf(error) })
     }
   }
 
-  const saveCleanup = async (enabled) => {
+  const saveCleanupSetting = async (key, enabled) => {
     store.set({ cleanupSaving: true, cleanupError: null, cleanupStatus: null })
     try {
-      const payload = await call('cleanup-settings', { cleanupOnDelete: enabled })
-      if (payload?.settings?.cleanupOnDelete !== enabled) throw new Error('Cleanup setting was not saved')
-      store.set({ cleanupSettings: payload.settings, cleanupSaving: false, cleanupStatus: { key: 'cleanup.saved' } })
+      const payload = await call('cleanup-settings', { [key]: enabled })
+      if (payload?.settings?.[key] !== enabled) throw new Error('Cleanup setting was not saved')
+      store.set({ cleanupSettings: cleanupSettingsOf(payload.settings), cleanupSaving: false, cleanupStatus: { key: 'cleanup.saved' } })
     } catch (error) {
       // Preserve the previous acknowledged setting; a failed save must not show
       // the proposed checkbox value as though the Host had accepted it.
@@ -579,26 +710,32 @@ function createActions(ctx) {
     }
   }
 
+  const saveCleanup = enabled => saveCleanupSetting('cleanupOnDelete', enabled)
+  const saveAttachmentCleanup = enabled => saveCleanupSetting('cleanupAttachmentsOnDelete', enabled)
+
   const retryCleanup = async () => {
     store.set({ cleanupSaving: true, cleanupError: null, cleanupStatus: null })
     try {
       const payload = await call('cleanup-retry', {})
       if (!Array.isArray(payload?.results)) throw new Error('Invalid cleanup result')
-      const failures = payload.results.flatMap(result => result.failed ?? [])
-      const count = payload.results.reduce((sum, result) => sum + (result.removed ?? 0), 0)
+      const summary = cleanupSummary(payload.results)
+      const details = attachmentCleanupDetails(payload.results.filter(result => result?.kind === 'attachments'))
       store.set({
-        cleanupSettings: payload.settings,
+        cleanupSettings: cleanupSettingsOf(payload.settings),
         cleanupSaving: false,
-        cleanupStatus: failures.length > 0
-          ? { key: 'cleanup.partial', params: { message: failures.map(failure => failure.reason).join('; ') } }
-          : { key: 'cleanup.done', params: { count } },
+        cleanupStatus: {
+          ...(summary.failed.length > 0
+            ? { key: 'cleanup.partial', params: { message: summary.failed.map(failure => failure?.reason ?? failure?.code ?? failure?.id ?? 'Unknown error').join('; ') } }
+            : { key: 'cleanup.done', params: { count: summary.removed } }),
+          ...(details.length > 0 ? { details } : {}),
+        },
       })
     } catch (error) {
       store.set({ cleanupSaving: false, cleanupError: messageOf(error) })
     }
   }
 
-  return { deleteOne, backupOne, backupMany, deleteMany, refreshBackups, restoreOne, removeOne, refreshCleanup, saveCleanup, retryCleanup }
+  return { deleteOne, backupOne, backupMany, deleteMany, refreshBackups, restoreOne, removeOne, refreshCleanup, saveCleanup, saveAttachmentCleanup, retryCleanup }
 }
 
 // ---------------------------------------------------------------------------
@@ -675,6 +812,9 @@ function SessionMenuItems({ sessionId, t, actions }) {
 /** `sidebar.footer.action`: the select-mode switch and the batch action bar. */
 function FooterActions({ wide, t, actions }) {
   const state = useStore()
+  const statusDetails = Array.isArray(state.status?.details)
+    ? state.status.details
+    : state.status?.details == null ? [] : [state.status.details]
   const count = state.ids.length
   const children = []
   if (!state.selecting) {
@@ -764,6 +904,12 @@ function FooterActions({ wide, t, actions }) {
       { className: 'dshsb-status', role: 'status' },
       state.status === null ? '' : t(state.status.key, state.status.params ?? {}),
     ),
+    ...statusDetails.map((detail, index) => createElement('p', {
+      key: `status-detail-${index}`,
+      className: detail?.key === 'status.attachmentsFailed' ? 'dshsb-error' : 'dshsb-status',
+      role: detail?.key === 'status.attachmentsFailed' ? 'alert' : undefined,
+    }, typeof detail === 'string' ? detail : t(detail.key, detail.params ?? {})),
+    ),
   )
 }
 
@@ -820,8 +966,8 @@ function BackupRow({ backup, pending, t, actions }) {
         { className: 'dshsb-itemMeta' },
         `${formatWhen(backup.createdAt)} · ${formatBytes(backup.bytes)}`,
       ),
-      backup.consistent === false || inconsistent > 0
-        ? createElement('span', { className: 'dshsb-itemWarn' }, t('dialog.backups.inconsistent', { count: inconsistent }))
+      backup.warning || backup.consistent === false || inconsistent > 0
+        ? createElement('span', { className: 'dshsb-itemWarn' }, backup.warning || t('dialog.backups.inconsistent', { count: inconsistent }))
         : null,
     ),
     createElement(
@@ -831,7 +977,7 @@ function BackupRow({ backup, pending, t, actions }) {
         key: 'restore',
         size: 'sm',
         disabled: backup.restorable === false,
-        title: backup.restorable === false ? t('dialog.backups.notRestorable') : undefined,
+        title: backup.restorable === false ? backup.warning || t('dialog.backups.notRestorable') : undefined,
         onClick: () => void actions.restoreOne(backup),
         children: t('dialog.backups.restore'),
       }),
@@ -881,14 +1027,24 @@ function BackupsDialog({ open, t, actions }) {
   })
 }
 
-/** Host-backed policy. Permission to delete temporary files is user-only. */
+/** Host-backed policies. Each file-cleanup permission is independently user-only. */
 function CleanupDialog({ open, t, actions }) {
   const state = useStore()
   useEffect(() => {
     if (open) void actions.refreshCleanup()
   }, [open])
   const settings = state.cleanupSettings
-  const pending = settings?.pending?.length ?? 0
+  const inventories = [
+    { enabled: settings?.cleanupOnDelete === true, pending: settings?.pending, errors: settings?.pendingErrors,
+      pendingKey: 'cleanup.pending', errorKey: 'cleanup.pendingErrors' },
+    { enabled: settings?.cleanupAttachmentsOnDelete === true, pending: settings?.attachmentPending, errors: settings?.attachmentPendingErrors,
+      pendingKey: 'cleanup.attachmentPending', errorKey: 'cleanup.attachmentPendingErrors' },
+  ].map(inventory => ({ ...inventory,
+    pending: Array.isArray(inventory.pending) ? inventory.pending : [],
+    errors: Array.isArray(inventory.errors) ? inventory.errors : [],
+  }))
+  const hasPending = inventories.some(inventory => inventory.pending.length > 0 || inventory.errors.length > 0)
+  const canRetry = inventories.some(inventory => inventory.enabled && (inventory.pending.length > 0 || inventory.errors.length > 0))
   return createElement(Modal, {
     open,
     onClose: () => { if (!state.cleanupSaving) store.closeDialog() },
@@ -901,23 +1057,51 @@ function CleanupDialog({ open, t, actions }) {
         createElement('label', { className: 'dshsb-cleanup-setting' },
           createElement('input', {
             type: 'checkbox',
+            name: 'cleanupOnDelete',
             checked: settings.cleanupOnDelete === true,
             disabled: !settings.editable || state.cleanupSaving || state.cleanupLoading,
             onChange: event => void actions.saveCleanup(event.target.checked),
           }),
           t('cleanup.enabled'),
         ),
+        createElement('label', { className: 'dshsb-cleanup-setting' },
+          createElement('input', {
+            type: 'checkbox',
+            name: 'cleanupAttachmentsOnDelete',
+            checked: settings.cleanupAttachmentsOnDelete === true,
+            disabled: !settings.editable || state.cleanupSaving || state.cleanupLoading,
+            onChange: event => void actions.saveAttachmentCleanup(event.target.checked),
+          }),
+          t('cleanup.attachmentsEnabled'),
+        ),
+        createElement('p', null, t('cleanup.attachmentsDescription')),
         createElement('p', null, t('cleanup.default')),
         !settings.editable ? createElement('p', null, t('cleanup.readOnly')) : null,
-        pending > 0 ? createElement('p', null, t('cleanup.pending', { count: pending })) : null,
-        pending > 0 ? createElement(Button, {
-          disabled: state.cleanupSaving || state.cleanupLoading || !settings.cleanupOnDelete,
+        ...inventories.map(inventory => createElement(Fragment, { key: inventory.pendingKey },
+          inventory.pending.length > 0 ? createElement('p', null, t(inventory.pendingKey, { count: inventory.pending.length })) : null,
+          inventory.errors.length > 0 ? createElement('p', null, t(inventory.errorKey, { count: inventory.errors.length })) : null,
+          inventory.errors.length > 0 ? createElement('ul', { className: 'dshsb-cleanup-errors' },
+            ...inventory.errors.map((issue, index) => createElement('li', { key: `${issue.sessionId ?? 'unknown'}-${index}` },
+              t('cleanup.pendingError', {
+                sessionId: issue.sessionId ?? 'unknown',
+                reason: issue.reason ?? issue.code ?? 'Unknown error',
+              }),
+            )),
+          ) : null,
+        )),
+        hasPending ? createElement(Button, {
+          disabled: state.cleanupSaving || state.cleanupLoading || !canRetry,
           onClick: () => void actions.retryCleanup(),
           children: t('cleanup.retry'),
         }) : null,
       ),
       state.cleanupSaving ? createElement('p', { role: 'status' }, t('cleanup.saving')) : null,
       state.cleanupStatus === null ? null : createElement('p', { role: 'status' }, t(state.cleanupStatus.key, state.cleanupStatus.params ?? {})),
+      ...(state.cleanupStatus?.details ?? []).map((detail, index) => createElement('p', {
+        key: `cleanup-detail-${index}`,
+        role: detail.key === 'status.attachmentsFailed' ? 'alert' : 'status',
+        className: detail.key === 'status.attachmentsFailed' ? 'dshsb-error' : undefined,
+      }, t(detail.key, detail.params ?? {}))),
       state.cleanupError === null ? null : createElement('p', { role: 'alert', className: 'dshsb-error' }, state.cleanupError),
     ),
     footer: createElement(Button, {
@@ -931,12 +1115,22 @@ function CleanupDialog({ open, t, actions }) {
 /** The failure dialog for errors the status line alone would bury. */
 function ErrorDialog({ open, t }) {
   const state = useStore()
+  const details = Array.isArray(state.error?.details)
+    ? state.error.details
+    : state.error?.details == null ? [] : [state.error.details]
   return createElement(Modal, {
     open,
     onClose: () => store.dismissError(),
     title: t('error.title'),
     closeLabel: t('dialog.close'),
-    children: createElement('p', null, state.error === null ? '' : t(state.error.key, state.error.params ?? {})),
+    children: createElement(Fragment, null,
+      createElement('p', null, state.error === null ? '' : t(state.error.key, state.error.params ?? {})),
+      ...details.map((detail, index) => createElement('p', {
+        key: `error-detail-${index}`,
+        className: 'dshsb-error',
+      }, typeof detail === 'string' ? detail : t(detail.key, detail.params ?? {})),
+      ),
+    ),
     footer: createElement(
       Button,
       { variant: 'primary', onClick: () => store.dismissError(), children: t('error.dismiss') },
@@ -990,6 +1184,9 @@ function DeleteOneDialog({ open, t, actions }) {
   const request = state.deleteReq
   const [deleting, setDeleting] = useState(false)
   const [error, setError] = useState(null)
+  useEffect(() => {
+    setError(null)
+  }, [request?.sessionId, open])
   if (request === null || request === undefined) return null
   const busy = Array.isArray(request.activity) && request.activity.length > 0
   const close = () => {
@@ -1003,15 +1200,29 @@ function DeleteOneDialog({ open, t, actions }) {
       .deleteOne(request.sessionId, busy ? { stopActivity: true } : undefined)
       .then((result) => {
         setDeleting(false)
-        store.closeDeleteOne()
-        const key = (result.cleanup?.failed?.length ?? 0) > 0 ? 'status.deletedCleanupPending'
-          : (result.cleanup?.removed ?? 0) > 0 ? 'status.deletedOneCleaned' : 'status.deletedOne'
-        store.setStatus({ key, params: { title: request.displayTitle, count: result.cleanup?.removed ?? 0 } })
+        if (store.getSnapshot().deleteReq === request) store.closeDeleteOne()
+        const count = (result.cleanup?.removed ?? 0) + (result.attachments?.removed ?? 0)
+        const key = (result.cleanup?.failed?.length ?? 0) > 0 || (result.attachments?.failed?.length ?? 0) > 0
+          ? 'status.deletedCleanupPending' : count > 0 ? 'status.deletedOneCleaned' : 'status.deletedOne'
+        const warnings = [
+          ...(Array.isArray(result.cleanup?.failed) ? result.cleanup.failed.map((failure) => failure?.reason) : []),
+          ...(Array.isArray(result.warnings) ? result.warnings : []),
+        ].map((warning) => String(warning ?? '').trim()).filter(Boolean)
+        const details = [
+          ...(warnings.length > 0 ? [{ key: 'status.deleteWarning', params: { message: warnings.join('; ') } }] : []),
+          ...attachmentCleanupDetails([result.attachments]),
+        ]
+        store.setStatus({
+          key,
+          params: { title: request.displayTitle, count },
+          ...(details.length > 0 ? { details } : {}),
+        })
         refreshList()
         leaveIfCurrent(request.sessionId)
       })
       .catch((reason) => {
         setDeleting(false)
+        if (store.getSnapshot().deleteReq !== request) return
         const cause = reason?.cause ?? reason
         const activity = busyActivityOf(cause)
         if (activity !== null) {
@@ -1023,9 +1234,13 @@ function DeleteOneDialog({ open, t, actions }) {
         // (no provider reported work, so stop-first would gain nothing): the
         // raw kernel sentence reads as if something were running — say what is
         // actually happening instead.
-        setError(cause?.code === 'workspace/session-active' ? t('deleteOne.leaseBusy') : messageOf(reason))
+        setError({
+          sessionId: request.sessionId,
+          message: cause?.code === 'workspace/session-active' ? t('deleteOne.leaseBusy') : messageOf(reason),
+        })
       })
   }
+  const visibleError = error?.sessionId === request.sessionId ? error.message : null
   return createElement(Modal, {
     open: open === true,
     onClose: close,
@@ -1058,7 +1273,7 @@ function DeleteOneDialog({ open, t, actions }) {
           )
         : null,
       deleting ? createElement('div', { className: 'dshsb-pending', role: 'status' }, t('deleteOne.pending')) : null,
-      error !== null ? createElement('div', { className: 'dshsb-error', role: 'alert' }, error) : null,
+      visibleError !== null ? createElement('div', { className: 'dshsb-error', role: 'alert' }, visibleError) : null,
     ),
   })
 }
