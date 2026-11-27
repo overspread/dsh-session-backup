@@ -8,6 +8,39 @@ This file records releases of the **dsh-session-backup plugin**. It is separate 
 
 Starting with this preview release, each release preserves its entries under the actual plugin version and release date, newest first. Stable and preview releases both list Added, Changed, Removed, and Fixed, explicitly stating “None” for empty categories, and publish the same notes on the corresponding GitHub Release. Do not reconstruct unverified historical releases.
 
+## 0.4.5-preview.2 — 2026-11-27
+
+预览测试版，通过 npm 的 `preview` 标签发布；正式版仍使用 `latest` 标签。
+
+Preview release published under the npm `preview` tag; stable releases continue to use `latest`.
+
+### 新增功能 / Added
+
+- 无。
+- None.
+
+### 功能调整 / Changed
+
+- 将上传副本的“本次运行保护”与“附件观察器在 Host 启动后才启用，需重启后重试”分开提示，明确各自的重试条件。
+- Distinguish protection during the current Host run from deferral caused by activating the attachment observer after startup, with separate retry guidance.
+
+### 移除功能 / Removed
+
+- 无。
+- None.
+
+### Bug 修复 / Fixed
+
+- 首次热启用附件观察器造成的正常保护不再同时计为回收失败，也不再误称所有暂缓副本都已在本次运行使用。
+- 合并重复的真实失败原因，保留失败数量与警告；单删、批删、删除备份和重试共用准确的回收详情。
+- Stop counting expected protection after first hot activation as a reclamation failure or claiming that every deferred copy was used during this Host run.
+- Deduplicate repeated failure reasons while retaining failure counts and warnings. Share accurate reclamation details across individual deletion, batch deletion, backup removal, and retry.
+
+### 升级说明 / Upgrade notes
+
+- 安装或更新后重启 DSH 后端（`dsh web`），再刷新页面。仅刷新浏览器不能解除热启用保护。仍被会话或备份引用的上传副本继续保留，原件不受影响。
+- Restart the DSH backend (`dsh web`) after installing or updating, then refresh the page. A browser refresh alone does not clear hot-activation protection. Copies still referenced by sessions or backups remain retained; originals are unaffected.
+
 ## 0.4.5-preview.1 — 2026-11-26
 
 预览测试版，通过 npm 的 `preview` 标签发布；正式版仍使用 `latest` 标签。

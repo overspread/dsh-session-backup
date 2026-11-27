@@ -562,20 +562,28 @@ test('a plugin remount during object verification preserves the same backend and
   assert.deepEqual((await f.settings()).attachmentPending, [])
 }, { cleanupAttachmentsOnDelete: true }))
 
-test('hot first activation remains deferred across remount; a simulated restart permits retry', () => fixture(async f => {
-  const item = await f.upload('hot observer candidate')
-  await f.queue(item)
-  let result = attachmentResult(await f.success('cleanup-retry', {}), f.id)
-  assert.equal(result.deferred, 1)
-  assert.match(result.failed[0].reason, /Restart/)
+test('hot activation reports three restart-protected copies without failures through delete, remove and retry', () => fixture(async f => {
+  const items = [await f.upload('hot first'), await f.upload('hot second'), await f.upload('hot third', 'file')]
+  for (const item of items) await f.attach(item)
+  const { deleted } = await f.success('delete', { sessionId: f.id })
+  assert.deepEqual(deleted.attachments, { removed: 0, bytes: 0, retained: 3, deferred: 0, failed: [] })
+  const { removed } = await f.success('remove', { path: (await f.backups())[0].path })
+  const expected = { removed: 0, bytes: 0, retained: 3, deferred: 3, restartRequired: 3, failed: [] }
+  assert.deepEqual(removed.attachments, expected)
+  const expectedRetry = { kind: 'attachments', sessionId: f.id, ...expected }
+  assert.deepEqual(attachmentResult(await f.success('cleanup-retry', {}), f.id), expectedRetry)
   f.services.set('webServer', { port: undefined })
   f.remount()
-  result = attachmentResult(await f.success('cleanup-retry', {}), f.id)
-  assert.equal(result.deferred, 1, 'remount cannot discard a guard attached to the backend Symbol')
-  assert.equal(await exists(item.path), true)
+  assert.deepEqual(attachmentResult(await f.success('cleanup-retry', {}), f.id), expectedRetry, 'remount cannot discard backend protection')
+  for (const item of items) assert.equal(await exists(item.path), true)
+  assert.deepEqual((await f.settings()).attachmentPending, [{ sessionId: f.id, count: 3 }])
   f.services.set('attachments', f.makeBackend())
   f.remount()
-  assert.equal(attachmentResult(await f.success('cleanup-retry', {}), f.id).removed, 1)
+  const reclaimed = attachmentResult(await f.success('cleanup-retry', {}), f.id)
+  assert.equal(reclaimed.removed, 3)
+  assert.deepEqual(reclaimed.failed, [])
+  assert.deepEqual((await f.settings()).attachmentPending, [])
+  for (const item of items) assert.equal(await exists(item.path), false)
 }, { cleanupAttachmentsOnDelete: true }, { hot: true }))
 
 test('uploads admitted while disabled stay pinned after enabling cleanup and remounting the plugin', () => fixture(async f => {

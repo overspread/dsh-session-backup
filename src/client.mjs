@@ -77,8 +77,9 @@ const zh = {
   'status.deletedOneCleaned': '已删除「{title}」，清理了 {count} 个文件',
   'status.deletedManyCleaned': '已删除 {count} 个会话，清理了 {files} 个文件',
   'status.attachmentsCleaned': '已回收 {count} 个上传文件副本（{bytes}）。',
-  'status.attachmentsRetained': '已保留 {count} 个上传文件副本：备份或其他会话仍有引用，或受本次 Host 运行保护。最后引用删除后可回收；本次运行使用过的副本须在 Host 重启后重试。原件不受影响。',
-  'status.attachmentsDeferred': '其中 {count} 个上传文件副本因本次 Host 运行使用过而受到保护，须在 Host 重启后重试回收；这不是清理错误。',
+  'status.attachmentsRetained': '已保留 {count} 个上传文件副本，原件不受影响。仍被备份或其他会话引用的副本，须在最后引用删除后才能回收。',
+  'status.attachmentsDeferred': '其中 {count} 个上传文件副本受本次 Host 运行保护，暂缓回收。正在处理的上传结束后可重试；已使用过的副本须在 Host 重启后重试回收。这不是清理错误。',
+  'status.attachmentsRestartRequired': '其中 {count} 个上传文件副本因附件观察器在 Host 启动后才启用而暂缓回收。请重启 Host 后重试；这不是清理错误。',
   'status.attachmentsFailed': '警告：{count} 个上传文件副本回收失败：{message}',
   'footer.count': '已选 {count} 个',
   'footer.backupSelected': '备份选中',
@@ -166,8 +167,9 @@ const en = {
   'status.deletedOneCleaned': 'Deleted “{title}” and cleaned up {count} files',
   'status.deletedManyCleaned': 'Deleted {count} sessions and cleaned up {files} files',
   'status.attachmentsCleaned': 'Reclaimed {count} uploaded file copies ({bytes}).',
-  'status.attachmentsRetained': '{count} uploaded file copies are retained because backups or other sessions still reference them, or this Host run protects them. Reclamation requires deleting the last reference; copies used during this run also require a Host restart before retrying. Originals are unaffected.',
-  'status.attachmentsDeferred': 'Of these, {count} uploaded file copies are protected because they were used during this Host run. Retry reclamation after the Host restarts; this is not a cleanup error.',
+  'status.attachmentsRetained': '{count} uploaded file copies are retained. Originals are unaffected. Copies still referenced by backups or other sessions can be reclaimed after their last reference is deleted.',
+  'status.attachmentsDeferred': 'Of these, {count} uploaded file copies are protected during this Host run and deferred. Retry after active uploads finish; copies already used require a Host restart before retrying. This is not a cleanup error.',
+  'status.attachmentsRestartRequired': 'Of these, {count} uploaded file copies are deferred because the attachment observer was activated after the Host started. Restart the Host, then retry; this is not a cleanup error.',
   'status.attachmentsFailed': 'Warning: {count} uploaded file copies could not be reclaimed: {message}',
   'footer.count': '{count} selected',
   'footer.backupSelected': 'Back up selected',
@@ -470,8 +472,9 @@ function cleanupSummary(results) {
     bytes: summary.bytes + (result?.bytes ?? 0),
     retained: summary.retained + (result?.retained ?? 0),
     deferred: summary.deferred + (result?.deferred ?? 0),
+    restartRequired: summary.restartRequired + (result?.restartRequired ?? 0),
     failed: [...summary.failed, ...(Array.isArray(result?.failed) ? result.failed : [])],
-  }), { removed: 0, bytes: 0, retained: 0, deferred: 0, failed: [] })
+  }), { removed: 0, bytes: 0, retained: 0, deferred: 0, restartRequired: 0, failed: [] })
 }
 
 /** Retention is normal; only failed candidates receive a warning. */
@@ -482,10 +485,11 @@ function attachmentCleanupDetails(results) {
   return [
     { key: 'status.attachmentsCleaned', params: { count: summary.removed, bytes: formatBytes(summary.bytes) } },
     ...(summary.retained > 0 ? [{ key: 'status.attachmentsRetained', params: { count: summary.retained } }] : []),
-    ...(summary.deferred > 0 ? [{ key: 'status.attachmentsDeferred', params: { count: summary.deferred } }] : []),
+    ...(summary.deferred > summary.restartRequired ? [{ key: 'status.attachmentsDeferred', params: { count: summary.deferred - summary.restartRequired } }] : []),
+    ...(summary.restartRequired > 0 ? [{ key: 'status.attachmentsRestartRequired', params: { count: summary.restartRequired } }] : []),
     ...(summary.failed.length > 0 ? [{ key: 'status.attachmentsFailed', params: {
       count: summary.failed.length,
-      message: summary.failed.map(failure => failure?.reason ?? failure?.code ?? failure?.id ?? 'Unknown error').join('; '),
+      message: [...new Set(summary.failed.map(failure => failure?.reason ?? failure?.code ?? failure?.id ?? 'Unknown error'))].join('; '),
     } }] : []),
   ]
 }
@@ -725,7 +729,7 @@ function createActions(ctx) {
         cleanupSaving: false,
         cleanupStatus: {
           ...(summary.failed.length > 0
-            ? { key: 'cleanup.partial', params: { message: summary.failed.map(failure => failure?.reason ?? failure?.code ?? failure?.id ?? 'Unknown error').join('; ') } }
+            ? { key: 'cleanup.partial', params: { message: [...new Set(summary.failed.map(failure => failure?.reason ?? failure?.code ?? failure?.id ?? 'Unknown error'))].join('; ') } }
             : { key: 'cleanup.done', params: { count: summary.removed } }),
           ...(details.length > 0 ? { details } : {}),
         },

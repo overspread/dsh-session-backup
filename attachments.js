@@ -387,8 +387,14 @@ export class AttachmentCleanupStore {
         if (refs.has(key)) { retained.push(entry); continue }
         if (!guard || guard.blocked(entry)) {
           retained.push(entry)
-          result.deferred += 1
-          if (guard?.reason) result.failed.push({ id: key, code: 'ATTACHMENTS_OBSERVER_UNAVAILABLE', reason: guard.reason })
+          if (guard?.early === false) {
+            // A hot first activation is expected protection, not a failed unlink.
+            // Keep this as a subset of deferred for older result consumers.
+            result.deferred += 1
+            result.restartRequired = (result.restartRequired ?? 0) + 1
+          } else if (guard?.reason) {
+            result.failed.push({ id: key, code: 'ATTACHMENTS_OBSERVER_UNAVAILABLE', reason: guard.reason })
+          } else result.deferred += 1
           continue
         }
         try {

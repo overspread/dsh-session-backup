@@ -302,6 +302,47 @@ test('mixed retries total actual removals and treat referenced or deferred uploa
   assert.doesNotMatch(rendered, /status.attachmentsFailed|cleanup.partial/)
 })
 
+test('retry groups three hot-start candidates into one restart notice without failure or usage claims', async () => {
+  const f = fixture(async () => ({
+    settings: { cleanupOnDelete: false, cleanupAttachmentsOnDelete: true, pending: [], attachmentPending: [{ sessionId: 'a', count: 3 }] },
+    results: [{ kind: 'attachments', removed: 0, bytes: 0, retained: 3, deferred: 3, restartRequired: 3, failed: [] }],
+  }))
+  await f.actions.retryCleanup()
+  assert.deepEqual(f.state().cleanupStatus, {
+    key: 'cleanup.done', params: { count: 0 }, details: [
+      { key: 'status.attachmentsCleaned', params: { count: 0, bytes: '0 B' } },
+      { key: 'status.attachmentsRetained', params: { count: 3 } },
+      { key: 'status.attachmentsRestartRequired', params: { count: 3 } },
+    ],
+  })
+  assert.equal(f.state().cleanupSettings.attachmentPending[0].count, 3)
+  const rendered = textOf(f.render('CleanupDialog')({ open: true, t: translate, actions: f.actions }).props.children)
+  assert.equal((rendered.match(/status.attachmentsRestartRequired/g) ?? []).length, 1)
+  assert.doesNotMatch(rendered, /status.attachmentsDeferred|status.attachmentsFailed|cleanup.partial/)
+})
+
+test('retry separates startup protection from used copies and keeps real failures with deduplicated reasons', async () => {
+  const f = fixture(async () => ({
+    settings: { cleanupOnDelete: false, cleanupAttachmentsOnDelete: true, pending: [], attachmentPending: [] },
+    results: [
+      { kind: 'attachments', removed: 0, retained: 2, deferred: 2, restartRequired: 2, failed: [] },
+      { kind: 'attachments', removed: 0, retained: 1, deferred: 1, restartRequired: 1, failed: [] },
+      { kind: 'attachments', removed: 0, retained: 1, deferred: 1, failed: [] },
+      { kind: 'attachments', removed: 0, retained: 2, deferred: 0, failed: [{ id: 'bad-a', reason: 'upload changed' }, { id: 'bad-b', reason: 'upload changed' }] },
+    ],
+  }))
+  await f.actions.retryCleanup()
+  assert.deepEqual(f.state().cleanupStatus, {
+    key: 'cleanup.partial', params: { message: 'upload changed' }, details: [
+      { key: 'status.attachmentsCleaned', params: { count: 0, bytes: '0 B' } },
+      { key: 'status.attachmentsRetained', params: { count: 6 } },
+      { key: 'status.attachmentsDeferred', params: { count: 1 } },
+      { key: 'status.attachmentsRestartRequired', params: { count: 3 } },
+      { key: 'status.attachmentsFailed', params: { count: 2, message: 'upload changed' } },
+    ],
+  })
+})
+
 test('mixed retry failures include reasons from both artifact kinds', async () => {
   const f = fixture(async () => ({
     settings: { cleanupOnDelete: true, cleanupAttachmentsOnDelete: true, pending: [], attachmentPending: [] },
@@ -334,14 +375,22 @@ test('localized cleanup text explains independent policies and upload retention 
   assert.match(en['cleanup.attachmentsDescription'], /originals are unaffected/)
   assert.match(en['cleanup.attachmentsDescription'], /backups or other sessions.*last reference is deleted/)
   assert.match(en['cleanup.attachmentsDescription'], /Only registered upload candidates.*historical orphan files are not scanned/)
-  for (const key of ['cleanup.attachmentsDescription', 'status.attachmentsRetained', 'status.attachmentsDeferred']) {
+  for (const key of ['cleanup.attachmentsDescription', 'status.attachmentsDeferred']) {
     assert.match(zh[key], /本次 Host 运行.*Host 重启/)
     assert.match(en[key], /this Host run.*Host restart/)
   }
+  assert.match(zh['status.attachmentsRetained'], /原件不受影响.*最后引用删除/)
+  assert.match(en['status.attachmentsRetained'], /Originals are unaffected.*last reference is deleted/)
+  assert.doesNotMatch(zh['status.attachmentsRetained'], /回收失败|使用过/)
+  assert.doesNotMatch(en['status.attachmentsRetained'], /errors|were used/)
   assert.match(zh['cleanup.attachmentsDescription'], /即使已不再使用也会保留/)
   assert.match(en['cleanup.attachmentsDescription'], /even after use ends/)
   assert.match(zh['status.attachmentsDeferred'], /重启后重试回收.*不是清理错误/)
-  assert.match(en['status.attachmentsDeferred'], /Host restarts.*not a cleanup error/)
+  assert.match(en['status.attachmentsDeferred'], /Host restart.*not a cleanup error/)
+  assert.match(zh['status.attachmentsRestartRequired'], /观察器在 Host 启动后才启用.*重启 Host 后重试.*不是清理错误/)
+  assert.match(en['status.attachmentsRestartRequired'], /observer was activated after the Host started.*Restart the Host.*not a cleanup error/)
+  assert.doesNotMatch(zh['status.attachmentsRestartRequired'], /使用过|回收失败/)
+  assert.doesNotMatch(en['status.attachmentsRestartRequired'], /were used|could not be reclaimed/)
   assert.match(zh['cleanup.default'], /独立/)
   assert.match(en['cleanup.default'], /independently/)
 })

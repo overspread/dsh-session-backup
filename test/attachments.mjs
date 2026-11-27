@@ -341,18 +341,23 @@ test('no observer guard defers candidates without unlinking them', () => fixture
   assert.equal(await exists(item.path), true)
 }))
 
-test('a hot observer survives remount and only a simulated backend restart permits retry', () => fixture(async f => {
-  const item = await f.upload()
-  const { id, store } = await f.candidate(item)
+test('a hot observer retains three unused candidates without failures until a backend restart', () => fixture(async f => {
+  const items = [await f.upload('hot first'), await f.upload('hot second'), await f.upload('hot third', 'file')]
+  const { id, store } = await f.candidate(items[0])
+  for (const item of items.slice(1)) await f.candidate(item, id)
   const hotStore = backend(f.home)
   const hot = observeAttachmentUse(context(hotStore, 3080), f.home)
   assert.equal(observeAttachmentUse(context(hotStore), f.home), hot)
-  const deferred = await store.cleanup(id, hot)
-  assertRetained(deferred)
-  assert.equal(deferred.deferred, 1)
-  assert.match(deferred.failed[0].reason, /Restart/)
+  assert.equal(hot.pins.size, 0, 'hot activation does not prove these copies were used')
+  assert.deepEqual(await store.cleanup(id, hot), {
+    removed: 0, bytes: 0, retained: 3, deferred: 3, restartRequired: 3, failed: [],
+  })
+  assert.deepEqual(await store.pending(), [{ sessionId: id, count: 3 }])
+  for (const item of items) assert.equal(await exists(item.path), true)
   const restarted = observeAttachmentUse(context(backend(f.home)), f.home)
-  assert.equal((await new AttachmentCleanupStore(f.home).cleanup(id, restarted)).removed, 1)
+  assert.equal((await new AttachmentCleanupStore(f.home).cleanup(id, restarted)).removed, 3)
+  assert.deepEqual(await store.pending(), [])
+  for (const item of items) assert.equal(await exists(item.path), false)
 }))
 
 test('new upload receipts pin candidates for the backend lifetime across plugin remounts', () => fixture(async f => {
@@ -410,7 +415,16 @@ for (const missing of ['backend', 'matching root', 'listener', 'local layout']) 
     if (missing === 'matching root') service.root = join(f.root, 'elsewhere')
     if (missing === 'listener') ctx = { get: name => name === 'attachments' ? service : undefined }
     if (missing === 'local layout') service.fileHostPath = () => '/unsupported-layout'
-    assert.equal(observeAttachmentUse(ctx, f.home).blocked({ kind: 'image', sha256: '0'.repeat(64) }), true)
+    const guard = observeAttachmentUse(ctx, f.home)
+    assert.equal(guard.blocked({ kind: 'image', sha256: '0'.repeat(64) }), true)
+    const item = await f.upload(`unsupported ${missing}`)
+    const { id, store } = await f.candidate(item)
+    const result = await store.cleanup(id, guard)
+    assertRetained(result)
+    assert.equal(result.failed[0].code, 'ATTACHMENTS_OBSERVER_UNAVAILABLE')
+    assert.equal(result.deferred, 0, 'unsupported backends remain errors, not normal Host protection')
+    assert.equal(result.restartRequired, undefined)
+    assert.equal(await exists(item.path), true)
   }))
 }
 
